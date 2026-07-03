@@ -108,13 +108,16 @@ namespace UMT
                 }
 
                 SourcePixels mainPixels = sourcePixels.Get(pmxMaterial.textureIndex);
-                (bool isBelowAlphaCoverageThreshold, float alphaCoverage, bool anyPixelOpaque) alphaDetection = DetectAlphaCoverage(mainPixels, model, faceIndexStart, faceIndexCount, options.alphaDetectionThreshold);
-                bool shouldBeTransparent = alphaDetection.isBelowAlphaCoverageThreshold || pmxMaterial.diffuse.a < 1.0f;
+                (bool isBelowAlphaCoverageThreshold, float alphaCoverage, bool anyPixelOpaque, bool anyPixelFullyTransparent) alphaDetection = DetectAlphaCoverage(mainPixels, model, faceIndexStart, faceIndexCount, options.alphaDetectionThreshold);
+                // Any fully-transparent texel (alpha == 0) in the footprint forces the transparent path, even when the average coverage stays above the threshold: a small transparent region is drowned out by the coverage average but must still render see-through.
+                bool shouldBeTransparent = alphaDetection.isBelowAlphaCoverageThreshold || alphaDetection.anyPixelFullyTransparent || pmxMaterial.diffuse.a < 1.0f;
                 float alphaCoverage = Mathf.Min(alphaDetection.alphaCoverage, pmxMaterial.diffuse.a);
                 bool anyPixelOpaque = alphaDetection.anyPixelOpaque && !(pmxMaterial.diffuse.a < 1.0f);
                 bool transparentWithZWrite = anyPixelOpaque || alphaCoverage >= options.alphaCoverageZWriteThreshold;
+                // A material that only turned transparent because of sparse fully-transparent texels is still mostly opaque (coverage above the transparent threshold), so its MMD edge should be kept rather than dropped as it is for genuinely see-through materials.
+                bool keepEdge = !alphaDetection.isBelowAlphaCoverageThreshold && !(pmxMaterial.diffuse.a < 1.0f);
                 Debug.Log(materialName + " alpha coverage: " + alphaCoverage.ToString("F3") + ", any opaque: " + anyPixelOpaque + ", transparent with ZWrite: " + transparentWithZWrite);
-                Material material = BuildMaterial(pmxMaterial, mainTexture, sphereTexture, materialName, shouldBeTransparent, transparentWithZWrite);
+                Material material = BuildMaterial(pmxMaterial, mainTexture, sphereTexture, materialName, shouldBeTransparent, transparentWithZWrite, keepEdge);
 
                 material.renderQueue = shouldBeTransparent ? 3000 + i : 2500 + i;
 
@@ -270,9 +273,10 @@ namespace UMT
             return textureIndex >= 0 && textureIndex < texturesByIndex.Length ? texturesByIndex[textureIndex] : null;
         }
 
-        private static Material BuildMaterial(PMXMaterial pmxMaterial, Texture2D mainTexture, Texture2D sphereTexture, string materialName, bool transparent, bool transparentWithZWrite)
+        private static Material BuildMaterial(PMXMaterial pmxMaterial, Texture2D mainTexture, Texture2D sphereTexture, string materialName, bool transparent, bool transparentWithZWrite, bool keepEdge)
         {
-            bool drawsEdge = (pmxMaterial.drawingFlags & PMXMaterial.DrawingFlags.DrawEdge) != 0 && !transparent;
+            // Genuinely see-through materials drop their edge, but a mostly-opaque material that only became transparent because of a few fully-transparent texels keeps it (keepEdge).
+            bool drawsEdge = (pmxMaterial.drawingFlags & PMXMaterial.DrawingFlags.DrawEdge) != 0 && (!transparent || keepEdge);
             Shader shader = GetShader(transparent, transparentWithZWrite, drawsEdge, out ShaderKind shaderKind);
             if (shader == null)
             {
@@ -385,7 +389,8 @@ namespace UMT
         private const int k_ResultCoveredCount = 0;
         private const int k_ResultAlphaSum = 1;
         private const int k_ResultAnyOpaque = 2;
-        private const int k_ResultCount = 3;
+        private const int k_ResultAnyFullyTransparent = 3;
+        private const int k_ResultCount = 4;
 
         /// <summary>
         /// Measures the alpha coverage of a material's texture over its UV footprint on the CPU, sampling the raw source pixels at every vertex UV and every triangle centroid (center of gravity) with a Burst-compiled parallel job, to decide whether the material should be rendered as transparent.
@@ -395,10 +400,10 @@ namespace UMT
         /// <param name="faceIndexStart">Start offset into <see cref="PMXModel.indices"/> for this material.</param>
         /// <param name="faceIndexCount">Number of indices this material consumes (a multiple of three).</param>
         /// <param name="alphaThreshold">Coverage value below which the material is considered transparent.</param>
-        /// <returns>A tuple of whether coverage is below the threshold, the measured average coverage, and whether any sampled pixel was fully opaque.</returns>
+        /// <returns>A tuple of whether coverage is below the threshold, the measured average coverage, whether any sampled pixel was fully opaque, and whether any sampled pixel was fully transparent.</returns>
         /// <exception cref="ArgumentNullException">Thrown when the model is null.</exception>
         /// <exception cref="ArgumentOutOfRangeException">Thrown when the index range is invalid.</exception>
-        public static (bool isBelowAlphaCoverageThreshold, float alphaCoverage, bool anyPixelOpaque) DetectAlphaCoverage(SourcePixels sourcePixels, PMXModel model, int faceIndexStart, int faceIndexCount, float alphaThreshold)
+        public static (bool isBelowAlphaCoverageThreshold, float alphaCoverage, bool anyPixelOpaque, bool anyPixelFullyTransparent) DetectAlphaCoverage(SourcePixels sourcePixels, PMXModel model, int faceIndexStart, int faceIndexCount, float alphaThreshold)
         {
             if (model == null)
             {
@@ -413,7 +418,7 @@ namespace UMT
             // A material with no geometry contributes no samples; treat it as fully opaque so it is never forced transparent, exactly as the GPU path's empty-footprint readback did.
             if (triangleCount == 0)
             {
-                return (false, 1.0f, true);
+                return (false, 1.0f, true, false);
             }
 
             // Compact this material's geometry: a UV per referenced vertex and re-based triangle indices, so the job can sample uv[i] for i < vertexCount and compute centroids for the rest on the fly.
@@ -456,13 +461,14 @@ namespace UMT
             float alphaCoverage = coveredSamples > 0 ? result[k_ResultAlphaSum] / (coveredSamples * k_AlphaCoverageScale) : 1.0f;
             bool isBelowAlphaCoverageThreshold = alphaCoverage < alphaThreshold;
             bool anyPixelOpaque = result[k_ResultAnyOpaque] != 0;
+            bool anyPixelFullyTransparent = result[k_ResultAnyFullyTransparent] != 0;
 
             uvs.Dispose();
             indices.Dispose();
             result.Dispose();
             pixels.Dispose();
 
-            return (isBelowAlphaCoverageThreshold, alphaCoverage, anyPixelOpaque);
+            return (isBelowAlphaCoverageThreshold, alphaCoverage, anyPixelOpaque, anyPixelFullyTransparent);
         }
 
         /// <summary>
@@ -654,6 +660,10 @@ namespace UMT
                 {
                     Interlocked.Exchange(ref basePointer[k_ResultAnyOpaque], 1);
                 }
+                else if (alpha == 0)
+                {
+                    Interlocked.Exchange(ref basePointer[k_ResultAnyFullyTransparent], 1);
+                }
             }
 
             /// <summary>
@@ -668,7 +678,8 @@ namespace UMT
 
                 // The source pixels are bottom-up (row 0 = bottom), so flip V to map PMX UV space onto them, and wrap so tiled UVs sample within bounds.
                 float u = uv.x - math.floor(uv.x);
-                float v = uv.y - math.floor(uv.y);
+                float v = 1.0f - uv.y;
+                v -= math.floor(v);
 
                 int x = (int)(u * textureWidth);
                 int y = (int)(v * textureHeight);
