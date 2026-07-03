@@ -112,6 +112,14 @@ The cleanest path is to convert during PMX import, which keeps each motion tied 
 
 To convert against a model you didn't just import, use the standalone window at **Tools ▸ UMT ▸ VMD Clip Converter**: pick a **Motion** (needs a `PMXModel`) or **Camera** target, choose **IKRuntimeSolved** or **IKBakedToFK** (baked mode can also bake physics to FK), and write out a standalone `.anim` asset.
 
+## Disclaimer
+
+This tool is provided as-is. The authors are not responsible for how users choose to use it, including any misuse.
+
+Users are solely responsible for ensuring they have the rights to any models, motions, textures, or other imported assets, and for complying with their licenses and usage terms.
+
+This includes, but is not limited to, importing models whose use is prohibited, and building or redistributing software that contains models whose redistribution is prohibited.
+
 ## License
 
 MIT (see [LICENSE](LICENSE.md)). Bundled third-party components ship under MIT / zlib / NAIST licenses; see [Third Party Notices](<Third Party Notices.md>) for the full attributions.
