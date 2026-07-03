@@ -867,6 +867,9 @@ namespace UMT
                     MMDBoneTransform.BoneSolverData runtimeData = boneSolverDataArray[boneIndex];
                     if (!runtimeData.hasSolvedTransform)
                     {
+                        // Clear any IK rotation carried from the previous frame as this bone's pose is (re)established from FK for the current frame.
+                        runtimeData.ikRotation = quaternion.identity;
+                        boneSolverDataArray[boneIndex] = runtimeData;
                         if ((runtimeData.rotationConstraint || runtimeData.translationConstraint) && runtimeContext.solveConstraints)
                         {
                             MMDBoneTransform.UpdateLocalMatrix(ref runtimeContext, boneIndex);
