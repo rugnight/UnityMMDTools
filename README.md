@@ -4,6 +4,8 @@ UMT is a toolkit for maximally reproducing MikuMikuDance (MMD) behaviour in Unit
 
 This project is inspired by [saba](https://github.com/benikabocha/saba) and [nanoem](https://github.com/hkrn/nanoem).
 
+Web demo: [Unity MMD Tools Demo](https://play.unity.com/en/games/7ab34080-389d-481e-af6e-1319e6ff874f/build)
+
 Available on the [Unity Asset Store](https://assetstore.unity.com/packages/package/9648399).
 
 ## What it does
