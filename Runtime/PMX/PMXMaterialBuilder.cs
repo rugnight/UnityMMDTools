@@ -668,8 +668,7 @@ namespace UMT
 
                 // The source pixels are bottom-up (row 0 = bottom), so flip V to map PMX UV space onto them, and wrap so tiled UVs sample within bounds.
                 float u = uv.x - math.floor(uv.x);
-                float v = 1.0f - uv.y;
-                v -= math.floor(v);
+                float v = uv.y - math.floor(uv.y);
 
                 int x = (int)(u * textureWidth);
                 int y = (int)(v * textureHeight);

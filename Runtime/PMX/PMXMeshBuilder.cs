@@ -149,12 +149,6 @@ namespace UMT
                 mesh.indexFormat = IndexFormat.UInt32;
             }
 
-            // SDEF meshes are deformed by the GPU compute pass, which reads the bind-pose source mesh buffer via a raw GraphicsBuffer. Request raw access; the layout is left as Unity's default so the skinned output stream split (deformed attributes only) is preserved, and the actual strides and offsets are queried at runtime rather than forced.
-            if (hasSDEF)
-            {
-                mesh.vertexBufferTarget |= GraphicsBuffer.Target.Raw;
-            }
-
             mesh.SetVertices(vertices);
             mesh.SetNormals(normals);
             mesh.SetUVs(0, uvs);
