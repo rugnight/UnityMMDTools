@@ -70,7 +70,7 @@ Available on the [Unity Asset Store](https://assetstore.unity.com/packages/packa
 
 Unity 2022.3 or newer, built-in render pipeline or URP. Materials build against lilToon when it's installed, otherwise URP Unlit or built-in Unlit.
 
-Native physics builds for **Windows x64**, **Android arm64-v8a**, and **Web/WebAssembly**. On other platforms you can still import models and convert non-physics motion, but live and baked physics need the native plugin.
+**Windows x64**, **Android arm64-v8a**, and **Web/WebAssembly** are the platforms shipped with prebuilt binaries. On other platforms you can still import models and convert motion without physics solving. Alternatively, you can compile the plugin yourself.
 
 ## Dependencies
 
