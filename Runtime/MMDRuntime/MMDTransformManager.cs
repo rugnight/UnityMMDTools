@@ -1,6 +1,7 @@
 using System;
 using Unity.Burst;
 using Unity.Collections;
+using Unity.Jobs;
 using Unity.Mathematics;
 using UnityEngine;
 using UnityEngine.Rendering;
@@ -51,8 +52,10 @@ namespace UMT
         public bool solveIK = true;
         /// <summary>Whether live Bullet physics runs in play mode.</summary>
         public bool livePhysics = true;
-        /// <summary>Whether GPU SDEF skinning runs for meshes that contain SDEF vertices.</summary>
+        /// <summary>Whether SDEF skinning runs for meshes that contain SDEF vertices.</summary>
         public bool doSDEFSkinning = true;
+        /// <summary>Selects GPU compute or CPU Burst-job SDEF skinning; a null compute shader forces CPU.</summary>
+        public SDEFSkinningMode sdefSkinningMode = SDEFSkinningMode.GPU;
         /// <summary>Compute shader driving GPU SDEF skinning, assigned during import.</summary>
         public ComputeShader sdefComputeShader;
         /// <summary>Animator on the model root driving the bone transforms.</summary>
@@ -61,7 +64,7 @@ namespace UMT
         public bool solveInEditMode = false;
 
         /// <summary>GPU SDEF skinners, one per SDEF renderer, dispatched after each bone solve.</summary>
-        private MMDSDEFSkinner[] m_SDEFSkinners = Array.Empty<MMDSDEFSkinner>();
+        public MMDSDEFSkinner[] sdefSkinners = Array.Empty<MMDSDEFSkinner>();
         /// <summary>Frame the SDEF skinners last dispatched on, to dispatch once per frame across cameras.</summary>
         private int m_LastSDEFDispatchFrame = -1;
 
@@ -155,11 +158,7 @@ namespace UMT
             {
                 InitializePhysics();
             }
-            // The skinner components serialize on the renderer children, but the manager's reference array does not, so rediscover them from the hierarchy on load. The import path's RegisterSDEFSkinners covers the fresh in-memory build before this runs.
-            if (m_SDEFSkinners.Length == 0)
-            {
-                m_SDEFSkinners = GetComponentsInChildren<MMDSDEFSkinner>(true);
-            }
+
             // SDEF skinning must overwrite the renderer's GPU vertex buffer AFTER Unity's own skinning, which runs in PostLateUpdate (after LateUpdate). Camera-render callbacks fire later still, so the compute dispatch is scheduled there to win over Unity's skinned result. Subscribe to both the SRP event and the built-in pipeline callback; only the active pipeline's event fires.
             RenderPipelineManager.beginCameraRendering += OnBeginCameraRendering;
             Camera.onPreRender += OnCameraPreRender;
@@ -183,10 +182,23 @@ namespace UMT
         }
 
         /// <summary>
-        /// Dispatches the SDEF skinners once per rendered frame, gated by the same solve conditions as the transform pass. Invoked from whichever render pipeline's pre-render callback is active.
+        /// Returns the SDEF skinning mode actually used this frame: a null compute shader forces CPU regardless of the serialized mode.
+        /// </summary>
+        /// <returns>The effective SDEF skinning mode.</returns>
+        private SDEFSkinningMode EffectiveSDEFMode()
+        {
+            return sdefComputeShader == null ? SDEFSkinningMode.CPU : sdefSkinningMode;
+        }
+
+        /// <summary>
+        /// Dispatches the GPU SDEF skinners once per rendered frame, gated by the same solve conditions as the transform pass. Invoked from whichever render pipeline's pre-render callback is active. No-op in CPU mode.
         /// </summary>
         private void DispatchSDEFSkinnersForFrame()
         {
+            if (EffectiveSDEFMode() != SDEFSkinningMode.GPU)
+            {
+                return;
+            }
             if (!solveInEditMode && !Application.isPlaying)
             {
                 return;
@@ -221,21 +233,22 @@ namespace UMT
                 return;
             }
 
-            if (!transformEnabled)
+            if (transformEnabled)
             {
-                return;
+                m_RuntimeContext.solveConstraints = solveConstraints;
+                m_RuntimeContext.solveIK = solveIK;
+
+                if (ShouldRunLivePhysics() && !m_RuntimeContext.physicsInitialized)
+                {
+                    physicsManager.ResetPhysics();
+                    m_RuntimeContext.physicsInitialized = true;
+                }
+
+                TransformAll(Time.deltaTime, true, ShouldRunLivePhysics());
             }
 
-            m_RuntimeContext.solveConstraints = solveConstraints;
-            m_RuntimeContext.solveIK = solveIK;
-
-            if (ShouldRunLivePhysics() && !m_RuntimeContext.physicsInitialized)
-            {
-                physicsManager.ResetPhysics();
-                m_RuntimeContext.physicsInitialized = true;
-            }
-
-            TransformAll(Time.deltaTime, true, ShouldRunLivePhysics());
+            // Reconcile CPU SDEF skinning every play-mode frame (even when the transform solve is disabled) so it tracks live bone poses like the GPU path, and so turning SDEF off or leaving CPU mode restores the renderer's original mesh.
+            ReconcileSDEFSkinners();
         }
 
         /// <summary>
@@ -364,7 +377,7 @@ namespace UMT
         /// <param name="skinners">SDEF skinners, one per SDEF renderer.</param>
         public void RegisterSDEFSkinners(MMDSDEFSkinner[] skinners)
         {
-            m_SDEFSkinners = skinners ?? Array.Empty<MMDSDEFSkinner>();
+            sdefSkinners = skinners ?? Array.Empty<MMDSDEFSkinner>();
         }
 
         /// <summary>
@@ -372,17 +385,74 @@ namespace UMT
         /// </summary>
         private void DispatchSDEFSkinners()
         {
-            if (!doSDEFSkinning || m_SDEFSkinners.Length == 0 || sdefComputeShader == null)
+            if (!doSDEFSkinning || sdefSkinners.Length == 0 || sdefComputeShader == null)
             {
                 return;
             }
 
-            for (int i = 0; i < m_SDEFSkinners.Length; ++i)
+            for (int i = 0; i < sdefSkinners.Length; ++i)
             {
-                MMDSDEFSkinner skinner = m_SDEFSkinners[i];
+                MMDSDEFSkinner skinner = sdefSkinners[i];
                 if (skinner != null)
                 {
                     skinner.Dispatch(sdefComputeShader);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Runs CPU SDEF skinning when it is the effective mode in play mode; otherwise restores any renderer left on its CPU runtime pass-through mesh. Invoked at the end of the bone solve so toggling SDEF or the mode at runtime takes effect immediately.
+        /// </summary>
+        private void ReconcileSDEFSkinners()
+        {
+            if (sdefSkinners.Length == 0)
+            {
+                return;
+            }
+
+            if (doSDEFSkinning && Application.isPlaying && EffectiveSDEFMode() == SDEFSkinningMode.CPU)
+            {
+                RunCPUSDEFSkinners();
+                return;
+            }
+
+            // CPU skinning should not run this frame; restore any renderer still on its CPU runtime mesh so the original mesh and bones are shown.
+            for (int i = 0; i < sdefSkinners.Length; ++i)
+            {
+                MMDSDEFSkinner skinner = sdefSkinners[i];
+                if (skinner != null)
+                {
+                    skinner.RestoreOriginalMesh();
+                }
+            }
+        }
+
+        /// <summary>
+        /// Schedules every CPU SDEF skinner's Burst job, completes them together so they run in parallel, then uploads each result to its runtime pass-through mesh.
+        /// </summary>
+        private void RunCPUSDEFSkinners()
+        {
+            NativeArray<JobHandle> handles = new NativeArray<JobHandle>(sdefSkinners.Length, Allocator.Temp);
+            int scheduledCount = 0;
+            for (int i = 0; i < sdefSkinners.Length; ++i)
+            {
+                MMDSDEFSkinner skinner = sdefSkinners[i];
+                if (skinner != null)
+                {
+                    handles[scheduledCount] = skinner.CpuScheduleJob();
+                    ++scheduledCount;
+                }
+            }
+
+            JobHandle.CompleteAll(handles.GetSubArray(0, scheduledCount));
+            handles.Dispose();
+
+            for (int i = 0; i < sdefSkinners.Length; ++i)
+            {
+                MMDSDEFSkinner skinner = sdefSkinners[i];
+                if (skinner != null)
+                {
+                    skinner.CpuApply();
                 }
             }
         }

@@ -4,7 +4,7 @@ using UnityEngine;
 namespace UMT
 {
     /// <summary>
-    /// Attaches an <see cref="MMDSDEFSkinner"/> to each generated <see cref="SkinnedMeshRenderer"/> whose mesh contains SDEF vertices, wiring the per-vertex SDEF data, morph table, and bindposes needed by the GPU skinning pass.
+    /// Attaches an <see cref="MMDSDEFSkinner"/> to each generated <see cref="SkinnedMeshRenderer"/> whose mesh contains SDEF vertices, wiring the original mesh, per-vertex SDEF data, morph table, and bindposes needed by the GPU or CPU skinning pass.
     /// </summary>
     public static class MMDSDEFSkinnerBuilder
     {
@@ -39,6 +39,7 @@ namespace UMT
 
                 skinner.targetRenderer = renderer;
                 skinner.model = model;
+                skinner.sharedMesh = importedMesh.mesh;
                 skinner.bindposes = importedMesh.mesh.bindposes;
                 skinner.sdefVertexData = importedMesh.sdefVertexData;
                 skinner.morphTable = importedMesh.morphTable;

@@ -236,14 +236,13 @@ namespace UMT
             }
 
             ComputeShader sdefComputeShader = options.umtResources != null ? options.umtResources.sdefComputeShader : null;
-            if (sdefComputeShader == null)
-            {
-                PMXUtilities.AddWarning(result, "SDEF meshes were imported but no SDEF compute shader is assigned on UMTResources; SDEF skinning is disabled for this model.");
-                return;
-            }
-
             MMDSDEFSkinner[] skinners = MMDSDEFSkinnerBuilder.Build(model, result.meshes);
             result.mmdTransformResult.transformManager.sdefComputeShader = sdefComputeShader;
+            if (sdefComputeShader == null)
+            {
+                PMXUtilities.AddWarning(result, "SDEF meshes were imported but no SDEF compute shader is assigned on UMTResources; falling back to CPU SDEF skinning.");
+                result.mmdTransformResult.transformManager.sdefSkinningMode = SDEFSkinningMode.CPU;
+            }
             result.mmdTransformResult.transformManager.RegisterSDEFSkinners(skinners);
         }
 

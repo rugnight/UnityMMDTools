@@ -5,6 +5,17 @@ using Unity.Mathematics;
 namespace UMT
 {
     /// <summary>
+    /// Selects how SDEF meshes are skinned at runtime: <c>GPU</c> dispatches the SDEF compute shader, <c>CPU</c> runs the equivalent Burst job. <c>GPU</c> is the default; a null compute shader forces <c>CPU</c>.
+    /// </summary>
+    public enum SDEFSkinningMode
+    {
+        /// <summary>GPU compute-shader SDEF skinning (default).</summary>
+        GPU,
+        /// <summary>CPU Burst-job SDEF skinning (play mode only).</summary>
+        CPU,
+    }
+
+    /// <summary>
     /// Per-vertex skinning data uploaded once to the SDEF compute shader. Layout is byte-for-byte compatible with the <c>SDEFVertexData</c> struct in <c>MMDSDEFSkinning.compute</c>; every field is 16 bytes so the C# blittable layout matches the HLSL <c>StructuredBuffer</c> element layout.
     /// </summary>
     [Serializable]
