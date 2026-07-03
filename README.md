@@ -2,6 +2,8 @@
 
 UMT is a toolkit for maximally reproducing MikuMikuDance (MMD) behaviour in Unity. It supports drag-and-drop import of PMX models, converts VMD motion to `AnimationClip` assets and runs Physics for MMD rigid bodies on a native Bullet solver.
 
+This project is inspired by [saba](https://github.com/benikabocha/saba) and [nanoem](https://github.com/hkrn/nanoem).
+
 Available on the [Unity Asset Store](https://assetstore.unity.com/packages/package/9648399).
 
 ## What it does
@@ -21,7 +23,7 @@ Available on the [Unity Asset Store](https://assetstore.unity.com/packages/packa
 
 - PMX 2.0 (2.1 read compatibility; no 2.1-exclusive features)
 - BDEF1, BDEF2, BDEF4 skinning
-- SDEF skinning (GPU compute skinning at runtime)
+- SDEF skinning
 - Vertex morphs (as blend shapes)
 - Group morphs (resolved to their referenced vertex morphs)
 - Bones, bind poses, humanoid avatar
