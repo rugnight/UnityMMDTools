@@ -5,6 +5,16 @@ All notable changes to this package will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-07-03
+
+### Added
+
+- CPU SDEF skinning. `MMDSDEFSkinner` now supports a Burst-job skinning path (`MMDSDEFSkinJob`) in addition to the existing GPU compute path, selected per `MMDTransformManager` via the new `sdefSkinningMode` (`SDEFSkinningMode.GPU`/`CPU`). CPU mode computes skinned vertices on the CPU and uploads them into an all-root-bone-weighted runtime pass-through mesh, so SDEF works on platforms without compute-shader support. A null compute shader forces CPU mode regardless of the serialized setting, and toggling SDEF or the mode at runtime takes effect immediately (restoring the renderer's original mesh when disabled). Both modes share one set of native buffers.
+
+### Fixed
+
+- Fixed flickering poses by clearing IK rotation for bones before establishing the pose from FK.
+
 ## [0.3.0] - 2026-07-02
 
 ### Added
