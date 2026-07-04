@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Text;
 using Unity.Collections;
+using Unity.Collections.LowLevel.Unsafe;
 using UnityEngine;
 
 namespace UMT
@@ -212,6 +213,18 @@ namespace UMT
             }
 
             array = new NativeArray<T>(count, Allocator.Persistent);
+        }
+
+        /// <summary>
+        /// Returns a mutable reference to a native array element, avoiding the full-struct copy of the indexer. The reference stays valid while the array's native buffer is alive; do not hold it across a dispose or reallocation.
+        /// </summary>
+        /// <typeparam name="T">The unmanaged element type of the native array.</typeparam>
+        /// <param name="array">The native array to reference into.</param>
+        /// <param name="index">The element index.</param>
+        /// <returns>A reference to the element at <paramref name="index"/>.</returns>
+        public static unsafe ref T ElementAt<T>(NativeArray<T> array, int index) where T : struct
+        {
+            return ref UnsafeUtility.ArrayElementAsRef<T>(array.GetUnsafePtr(), index);
         }
     }
 }

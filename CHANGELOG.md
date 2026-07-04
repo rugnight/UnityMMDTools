@@ -5,6 +5,24 @@ All notable changes to this package will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-07-05
+
+### Changed
+
+- MMD transform solver optimization pass, behaviour-preserving (physics bakes verified bit-exact against reference clips). `BoneSolverData` is split into a read-only `BoneSolverConfig` and a mutable `BoneSolverState` (hot/cold), and the Burst solver reads/writes elements by reference instead of copying full structs. Redundant work removed from the hot path: `float4x4.TRS` with unit scale replaced by the rotation/translation constructor, constraint-target loads hoisted into the constrained branch, and dead IK locals deleted.
+- Bone transform sampling and flushing, and rigid-body transform flushing, now run as Burst `IJobParallelForTransform` jobs over cached `TransformAccessArray`s, replacing per-bone managed `Transform` calls. The per-frame managed mirror copy (`MMDBoneTransform.runtimeData`) is gone; external pose resets are signalled through a `solverResetPending` flag instead.
+- Physics stepping memoizes bone world matrices within a step and iterates precomputed simulated/kinetic rigid-body index lists instead of re-filtering and re-sorting them every step.
+- Play-mode GPU SDEF skinning is now zero-GC per frame. The skinner swaps in the same pass-through mesh the CPU path uses and writes skinned vertices into its vertex buffer through a compute command buffer encoded once at initialization, instead of re-acquiring the renderer's ping-ponged output buffer (and re-encoding) every frame; Unity's own skinning consumes the pass-through mesh, keeping motion vectors correct. Edit mode keeps the previous write-to-renderer-output behaviour. Bone skinning matrices and quaternions are computed by a single parallel Burst transform job shared by the GPU and CPU paths.
+- The VMD Clip Converter window now saves generated `.anim` files with text serialization.
+
+### Added
+
+- `MMDSDEFSkinner.NotifyRigChanged()` — call before re-rigging a skinner's renderer (changing `bones`/`rootBone`) so cached bone accessors and GPU resources are rebuilt on the next dispatch.
+
+### Removed
+
+- Breaking: `MMDBoneTransform.BoneSolverData` (replaced by `BoneSolverConfig`/`BoneSolverState`), the public `MMDBoneTransform.runtimeData` mirror field, and the unused `boneName`/`localMatrix` solver fields. VMD converter helper signatures were updated to take the split config/state arrays.
+
 ## [0.3.1] - 2026-07-03
 
 ### Added

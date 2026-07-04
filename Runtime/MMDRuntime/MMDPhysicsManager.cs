@@ -3,8 +3,10 @@ using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using Unity.Burst;
 using Unity.Collections;
+using Unity.Jobs;
 using Unity.Mathematics;
 using UnityEngine;
+using UnityEngine.Jobs;
 using static UMT.PMXUtilities;
 
 namespace UMT
@@ -40,8 +42,12 @@ namespace UMT
             internal MMDBulletPhysics bulletPhysicsContext;
             /// <summary>Scratch buffer of rigid-body world transforms.</summary>
             internal NativeArray<float4x4> worldTransforms;
-            /// <summary>Scratch buffer of rigid-body indices paired with <see cref="worldTransforms"/>.</summary>
+            /// <summary>Scratch buffer of rigid-body indices paired with <see cref="worldTransforms"/>, prefilled with the identity mapping at initialization.</summary>
             internal NativeArray<int> rigidBodyIndices;
+            /// <summary>Indices of kinetic (bone-driven) rigid bodies, precomputed at initialization.</summary>
+            internal NativeArray<int> kineticRigidBodyIndices;
+            /// <summary>Indices of simulated rigid bodies with related bones, sorted by (bone transform level, related bone index), precomputed at initialization.</summary>
+            internal NativeArray<int> sortedSimulatedRigidBodyIndices;
             /// <summary>Per-rigid-body simulation data mirrored to the native context.</summary>
             internal NativeArray<MMDRigidBody.RigidBodySimulationData> rigidBodySimulationData;
             /// <summary>Whether the initial bone-driven rigid-body pose has been applied.</summary>
@@ -49,6 +55,25 @@ namespace UMT
             internal bool initialPoseApplied;
         }
         private PhysicsSolverContext m_PhysicsSolverContext;
+
+        /// <summary>Transform access array over the rigid-body owner objects driving the flush transform job, rebuilt with the runtime data.</summary>
+        private TransformAccessArray m_RigidBodyTransformAccess;
+
+        /// <summary>
+        /// Writes each rigid body's world transform onto its owner object's Unity transform.
+        /// </summary>
+        [BurstCompile]
+        private struct FlushRigidBodyTransformsJob : IJobParallelForTransform
+        {
+            /// <summary>Rigid-body world transforms, indexed by rigid-body array position.</summary>
+            [ReadOnly] internal NativeArray<float4x4> worldTransforms;
+
+            public void Execute(int index, TransformAccess rigidBodyTransform)
+            {
+                float4x4 worldTransform = worldTransforms[index];
+                rigidBodyTransform.SetPositionAndRotation(worldTransform.c3.xyz, new quaternion(worldTransform));
+            }
+        }
 
         /// <summary>
         /// Reference to this manager's mutable physics solver context.
@@ -151,6 +176,7 @@ namespace UMT
             }
 
             PhysicsMath.ComputeRigidBodyTransforms(ref runtimeContext.rigidBodySimulationData);
+            PhysicsMath.BuildStaticRigidBodyLists(ref runtimeContext);
             runtimeContext.bulletPhysicsContext.BuildRigidBodies(runtimeContext.rigidBodySimulationData);
             runtimeContext.bulletPhysicsContext.BuildJoints(BuildPMXJoints(model, runtimeContext.rigidBodySimulationData));
             runtimeContext.bulletPhysicsContext.BuildGround(enableGroundCollision, k_MMDGroundCollisionGroup, k_MMDGroundCollisionMask);
@@ -186,6 +212,8 @@ namespace UMT
 
             DisposeNativeArray(ref runtimeContext.worldTransforms);
             DisposeNativeArray(ref runtimeContext.rigidBodyIndices);
+            DisposeNativeArray(ref runtimeContext.kineticRigidBodyIndices);
+            DisposeNativeArray(ref runtimeContext.sortedSimulatedRigidBodyIndices);
             DisposeNativeArray(ref runtimeContext.rigidBodySimulationData);
             runtimeContext = default;
         }
@@ -224,8 +252,14 @@ namespace UMT
             }
 
             m_PhysicsSolverContext.initialPoseApplied = false;
+            if (m_RigidBodyTransformAccess.isCreated)
+            {
+                m_RigidBodyTransformAccess.Dispose();
+            }
             DisposeNativeArray(ref m_PhysicsSolverContext.worldTransforms);
             DisposeNativeArray(ref m_PhysicsSolverContext.rigidBodyIndices);
+            DisposeNativeArray(ref m_PhysicsSolverContext.kineticRigidBodyIndices);
+            DisposeNativeArray(ref m_PhysicsSolverContext.sortedSimulatedRigidBodyIndices);
             DisposeNativeArray(ref m_PhysicsSolverContext.rigidBodySimulationData);
         }
 
@@ -272,6 +306,17 @@ namespace UMT
             }
 
             ReallocateArraysIfNeeded(rigidBodies.Length);
+            PhysicsMath.BuildStaticRigidBodyLists(ref m_PhysicsSolverContext);
+
+            if (m_RigidBodyTransformAccess.isCreated)
+            {
+                m_RigidBodyTransformAccess.Dispose();
+            }
+            m_RigidBodyTransformAccess = new TransformAccessArray(rigidBodies.Length);
+            for (int i = 0; i < rigidBodies.Length; ++i)
+            {
+                m_RigidBodyTransformAccess.Add(rigidBodies[i].transform);
+            }
         }
 
         private void BuildRigidBodies()
@@ -316,26 +361,17 @@ namespace UMT
 
             if (usePhysicsTransforms && m_PhysicsSolverContext.bulletPhysicsContext.isValid)
             {
-                for (int i = 0; i < rigidBodyCount; ++i)
-                {
-                    m_PhysicsSolverContext.rigidBodyIndices[i] = m_PhysicsSolverContext.rigidBodySimulationData[i].rigidBodyIndex;
-                }
-
                 m_PhysicsSolverContext.bulletPhysicsContext.GetRigidBodyMotionTransforms(rigidBodyCount, m_PhysicsSolverContext.rigidBodyIndices, ref m_PhysicsSolverContext.worldTransforms);
             }
             else
             {
                 for (int i = 0; i < rigidBodyCount; ++i)
                 {
-                    m_PhysicsSolverContext.worldTransforms[i] = PhysicsMath.ComputeRigidBodyWorldTransform(m_PhysicsSolverContext.rigidBodySimulationData[i], in transformManagerContext.boneSolverData);
+                    m_PhysicsSolverContext.worldTransforms[i] = PhysicsMath.ComputeRigidBodyWorldTransform(m_PhysicsSolverContext.rigidBodySimulationData[i], in transformManagerContext.boneStateData);
                 }
             }
 
-            for (int i = 0; i < rigidBodyCount; ++i)
-            {
-                float4x4 worldTransform = m_PhysicsSolverContext.worldTransforms[i];
-                rigidBodies[i].transform.SetPositionAndRotation(worldTransform.c3.xyz, new quaternion(worldTransform));
-            }
+            new FlushRigidBodyTransformsJob { worldTransforms = m_PhysicsSolverContext.worldTransforms, }.Schedule(m_RigidBodyTransformAccess).Complete();
 
             // Joints are rigidly parented to rigid body A, so their local transform is fixed at build time and tracks rigid body A through the hierarchy. Do not overwrite it here: the native frameInA uses rigid body A's bone-offset rest frame, a different basis than the build-time local placement, so writing it displaces the joint object and that displacement persists after exiting play mode.
         }
@@ -417,14 +453,7 @@ namespace UMT
         {
             bone.transform.localPosition = bone.initialLocalPosition;
             bone.transform.localRotation = bone.initialLocalRotation;
-            bone.runtimeData = MMDBoneTransform.BoneSolverData.CreateDefault();
-            bone.runtimeData.localPosition = bone.initialLocalPosition;
-            bone.runtimeData.localRotation = bone.initialLocalRotation;
-            bone.runtimeData.localPositionForIKLink = bone.initialLocalPosition;
-            bone.runtimeData.localRotationForIKLink = bone.initialLocalRotation;
-            bone.runtimeData.localMatrix = float4x4.TRS(bone.initialLocalPosition, bone.initialLocalRotation, new float3(1.0f, 1.0f, 1.0f));
-            bone.runtimeData.solvedLocalPosition = bone.initialLocalPosition;
-            bone.runtimeData.solvedLocalRotation = bone.initialLocalRotation;
+            bone.solverResetPending = true;
         }
 
         [BurstCompile]
@@ -448,6 +477,50 @@ namespace UMT
             }
 
             /// <summary>
+            /// Precomputes the static rigid-body index lists consumed each physics step: the identity index mapping, the kinetic (bone-driven) body list, and the simulated body list sorted by (bone transform level, related bone index). The filters and sort keys are immutable per model, so this runs once at initialization instead of re-filtering and re-sorting every step.
+            /// </summary>
+            /// <param name="runtimeContext">Physics solver context with populated rigid-body simulation data and an allocated index scratch buffer.</param>
+            internal static void BuildStaticRigidBodyLists(ref PhysicsSolverContext runtimeContext)
+            {
+                int kineticCount = 0;
+                int simulatedCount = 0;
+                for (int i = 0; i < runtimeContext.rigidBodySimulationData.Length; ++i)
+                {
+                    MMDRigidBody.RigidBodySimulationData rigidBody = runtimeContext.rigidBodySimulationData[i];
+                    runtimeContext.rigidBodyIndices[i] = rigidBody.rigidBodyIndex;
+                    if (rigidBody.mode == PMXRigidBody.Mode.Kinetic)
+                    {
+                        ++kineticCount;
+                    }
+                    if (IsSimulated(rigidBody) && rigidBody.hasRelatedBone)
+                    {
+                        ++simulatedCount;
+                    }
+                }
+
+                ResizePersistent(ref runtimeContext.kineticRigidBodyIndices, kineticCount);
+                ResizePersistent(ref runtimeContext.sortedSimulatedRigidBodyIndices, simulatedCount);
+                kineticCount = 0;
+                simulatedCount = 0;
+                for (int i = 0; i < runtimeContext.rigidBodySimulationData.Length; ++i)
+                {
+                    MMDRigidBody.RigidBodySimulationData rigidBody = runtimeContext.rigidBodySimulationData[i];
+                    if (rigidBody.mode == PMXRigidBody.Mode.Kinetic)
+                    {
+                        runtimeContext.kineticRigidBodyIndices[kineticCount] = i;
+                        ++kineticCount;
+                    }
+                    if (IsSimulated(rigidBody) && rigidBody.hasRelatedBone)
+                    {
+                        runtimeContext.sortedSimulatedRigidBodyIndices[simulatedCount] = i;
+                        ++simulatedCount;
+                    }
+                }
+
+                runtimeContext.sortedSimulatedRigidBodyIndices.Sort(new RigidBodyTransformLevelComparer { rigidBodies = runtimeContext.rigidBodySimulationData, });
+            }
+
+            /// <summary>
             /// Burst implementation that advances one MMD physics step: syncs or seeds bone-driven rigid bodies, steps the native Bullet simulation when time elapses, and writes simulated transforms back to bones.
             /// </summary>
             /// <param name="elapsedTime">Elapsed time for the step; values at or below zero skip the simulation advance.</param>
@@ -459,6 +532,12 @@ namespace UMT
                 if (!runtimeContext.bulletPhysicsContext.isValid)
                 {
                     return;
+                }
+
+                // The prepare pass below memoizes observed bone world matrices per physics step; clear the per-step flags so no matrix computed in an earlier step (or rewritten by IK since) is trusted.
+                for (int i = 0; i < transformManagerContext.boneStateData.Length; ++i)
+                {
+                    PMXUtilities.ElementAt(transformManagerContext.boneStateData, i).worldMatrixValid = false;
                 }
 
                 PrepareRigidBodyRelatedBoneMatrices(ref transformManagerContext, ref runtimeContext);
@@ -485,8 +564,7 @@ namespace UMT
                 for (int i = 0; i < runtimeContext.rigidBodySimulationData.Length; ++i)
                 {
                     MMDRigidBody.RigidBodySimulationData rigidBody = runtimeContext.rigidBodySimulationData[i];
-                    runtimeContext.worldTransforms[i] = ComputeRigidBodyWorldTransform(rigidBody, in transformManagerContext.boneSolverData);
-                    runtimeContext.rigidBodyIndices[i] = rigidBody.rigidBodyIndex;
+                    runtimeContext.worldTransforms[i] = ComputeRigidBodyWorldTransform(rigidBody, in transformManagerContext.boneStateData);
                 }
 
                 runtimeContext.bulletPhysicsContext.SetRigidBodyTransforms(runtimeContext.rigidBodySimulationData.Length, runtimeContext.worldTransforms, runtimeContext.rigidBodyIndices, true);
@@ -496,18 +574,12 @@ namespace UMT
 
             private static void SyncBoneDrivenRigidBodies(in MMDTransformManager.SolverContext transformManagerContext, ref PhysicsSolverContext runtimeContext)
             {
-                int count = 0;
-                for (int i = 0; i < runtimeContext.rigidBodySimulationData.Length; ++i)
+                for (int i = 0; i < runtimeContext.kineticRigidBodyIndices.Length; ++i)
                 {
-                    MMDRigidBody.RigidBodySimulationData rigidBody = runtimeContext.rigidBodySimulationData[i];
-                    if (rigidBody.mode == PMXRigidBody.Mode.Kinetic)
-                    {
-                        runtimeContext.worldTransforms[count] = ComputeRigidBodyWorldTransform(rigidBody, in transformManagerContext.boneSolverData);
-                        runtimeContext.rigidBodyIndices[count] = rigidBody.rigidBodyIndex;
-                        ++count;
-                    }
+                    MMDRigidBody.RigidBodySimulationData rigidBody = runtimeContext.rigidBodySimulationData[runtimeContext.kineticRigidBodyIndices[i]];
+                    runtimeContext.worldTransforms[i] = ComputeRigidBodyWorldTransform(rigidBody, in transformManagerContext.boneStateData);
                 }
-                runtimeContext.bulletPhysicsContext.SetRigidBodyTransforms(count, runtimeContext.worldTransforms, runtimeContext.rigidBodyIndices, true);
+                runtimeContext.bulletPhysicsContext.SetRigidBodyTransforms(runtimeContext.kineticRigidBodyIndices.Length, runtimeContext.worldTransforms, runtimeContext.kineticRigidBodyIndices, true);
             }
 
             private static void PrepareRigidBodyRelatedBoneMatrices(ref MMDTransformManager.SolverContext transformManagerContext, ref PhysicsSolverContext runtimeContext)
@@ -524,27 +596,29 @@ namespace UMT
 
             private static void PrepareBoneWorldMatrix(ref MMDTransformManager.SolverContext transformManagerContext, int boneIndex)
             {
-                MMDBoneTransform.BoneSolverData runtimeData = transformManagerContext.boneSolverData[boneIndex];
-                if (runtimeData.hasSolvedTransform)
+                ref MMDBoneTransform.BoneSolverState state = ref PMXUtilities.ElementAt(transformManagerContext.boneStateData, boneIndex);
+                if (state.hasSolvedTransform || state.worldMatrixValid)
                 {
                     return;
                 }
 
-                if (runtimeData.parentBoneIndex >= 0)
+                ref MMDBoneTransform.BoneSolverConfig config = ref PMXUtilities.ElementAt(transformManagerContext.boneConfigData, boneIndex);
+                if (config.parentBoneIndex >= 0)
                 {
-                    PrepareBoneWorldMatrix(ref transformManagerContext, runtimeData.parentBoneIndex);
+                    PrepareBoneWorldMatrix(ref transformManagerContext, config.parentBoneIndex);
                 }
 
-                if ((runtimeData.rotationConstraint || runtimeData.translationConstraint) && transformManagerContext.solveConstraints)
+                if ((config.rotationConstraint || config.translationConstraint) && transformManagerContext.solveConstraints)
                 {
                     MMDBoneTransform.UpdateLocalMatrix(ref transformManagerContext, boneIndex);
                 }
                 else
                 {
                     float4x4 parentWorldMatrix = MMDBoneTransform.GetParentWorldMatrix(ref transformManagerContext, boneIndex);
-                    MMDBoneTransform.ObserveLocalMatrix(ref runtimeData, parentWorldMatrix);
-                    transformManagerContext.boneSolverData[boneIndex] = runtimeData;
+                    MMDBoneTransform.ObserveLocalMatrix(in config, ref state, parentWorldMatrix);
                 }
+
+                state.worldMatrixValid = true;
             }
 
             private struct RigidBodyTransformLevelComparer : IComparer<int>
@@ -562,25 +636,12 @@ namespace UMT
 
             private static void ApplyDynamicRigidBodiesToBones(ref MMDTransformManager.SolverContext transformManagerContext, ref PhysicsSolverContext runtimeContext)
             {
-                int count = 0;
-                for (int i = 0; i < runtimeContext.rigidBodySimulationData.Length; ++i)
-                {
-                    MMDRigidBody.RigidBodySimulationData rigidBody = runtimeContext.rigidBodySimulationData[i];
-                    if (!IsSimulated(rigidBody) || !rigidBody.hasRelatedBone)
-                    {
-                        continue;
-                    }
-
-                    runtimeContext.rigidBodyIndices[count] = i;
-                    count++;
-                }
-
-                runtimeContext.rigidBodyIndices.GetSubArray(0, count).Sort(new RigidBodyTransformLevelComparer { rigidBodies = runtimeContext.rigidBodySimulationData, });
-                runtimeContext.bulletPhysicsContext.GetRigidBodyMotionTransforms(count, runtimeContext.rigidBodyIndices, ref runtimeContext.worldTransforms);
+                int count = runtimeContext.sortedSimulatedRigidBodyIndices.Length;
+                runtimeContext.bulletPhysicsContext.GetRigidBodyMotionTransforms(count, runtimeContext.sortedSimulatedRigidBodyIndices, ref runtimeContext.worldTransforms);
 
                 for (int i = 0; i < count; ++i)
                 {
-                    MMDRigidBody.RigidBodySimulationData rigidBody = runtimeContext.rigidBodySimulationData[runtimeContext.rigidBodyIndices[i]];
+                    MMDRigidBody.RigidBodySimulationData rigidBody = runtimeContext.rigidBodySimulationData[runtimeContext.sortedSimulatedRigidBodyIndices[i]];
                     float4x4 boneWorldMatrix = math.mul(runtimeContext.worldTransforms[i], rigidBody.boneLocalTransform);
                     if (rigidBody.mode == PMXRigidBody.Mode.DynamicBoneAligned)
                     {
@@ -597,11 +658,11 @@ namespace UMT
             /// Computes a rigid body's world transform, composing its related bone's world matrix with its initial transform when bone-related, or returning the initial transform otherwise.
             /// </summary>
             /// <param name="rigidBody">Rigid-body simulation data to transform.</param>
-            /// <param name="boneSolverDataArray">Bone solver data used to resolve the related bone's world matrix.</param>
+            /// <param name="boneStateData">Bone solver state used to resolve the related bone's world matrix.</param>
             /// <returns>The rigid body's world transform matrix.</returns>
-            internal static float4x4 ComputeRigidBodyWorldTransform(MMDRigidBody.RigidBodySimulationData rigidBody, in NativeArray<MMDBoneTransform.BoneSolverData> boneSolverDataArray)
+            internal static float4x4 ComputeRigidBodyWorldTransform(MMDRigidBody.RigidBodySimulationData rigidBody, in NativeArray<MMDBoneTransform.BoneSolverState> boneStateData)
             {
-                return rigidBody.hasRelatedBone ? math.mul(boneSolverDataArray[rigidBody.relatedBoneIndex].worldMatrix, rigidBody.initialTransform) : rigidBody.initialTransform;
+                return rigidBody.hasRelatedBone ? math.mul(PMXUtilities.ElementAt(boneStateData, rigidBody.relatedBoneIndex).worldMatrix, rigidBody.initialTransform) : rigidBody.initialTransform;
             }
 
             private static void ShiftKineticBoneAlignedBodyPosition(ref MMDBulletPhysics context, MMDRigidBody.RigidBodySimulationData rigidBody, float3 modelTranslationDelta)
@@ -616,7 +677,6 @@ namespace UMT
 
             private static void ApplyKineticWorldMatrixToBone(ref MMDTransformManager.SolverContext transformManagerContext, int boneIndex, float4x4 worldMatrix)
             {
-                MMDBoneTransform.BoneSolverData runtimeData = transformManagerContext.boneSolverData[boneIndex];
                 float4x4 parentWorldMatrix = MMDBoneTransform.GetParentWorldMatrix(ref transformManagerContext, boneIndex);
                 float4x4 localMatrix = math.mul(math.inverse(parentWorldMatrix), worldMatrix);
                 float3 localPosition = localMatrix.c3.xyz;
@@ -626,12 +686,12 @@ namespace UMT
 
             private static float3 ApplyKineticBoneAlignedWorldMatrixToBone(ref MMDTransformManager.SolverContext transformManagerData, int boneIndex, float4x4 worldMatrix)
             {
-                MMDBoneTransform.BoneSolverData runtimeData = transformManagerData.boneSolverData[boneIndex];
+                float3 boneLocalPosition = PMXUtilities.ElementAt(transformManagerData.boneStateData, boneIndex).localPosition;
                 float4x4 parentWorldMatrix = MMDBoneTransform.GetParentWorldMatrix(ref transformManagerData, boneIndex);
                 float4x4 localMatrix = math.mul(math.inverse(parentWorldMatrix), worldMatrix);
                 float3 localPosition = localMatrix.c3.xyz;
-                float3 localTranslationDelta = localPosition - runtimeData.localPosition;
-                MMDBoneTransform.ApplyLocalTransformToBone(ref transformManagerData, boneIndex, runtimeData.localPosition, new quaternion(localMatrix));
+                float3 localTranslationDelta = localPosition - boneLocalPosition;
+                MMDBoneTransform.ApplyLocalTransformToBone(ref transformManagerData, boneIndex, boneLocalPosition, new quaternion(localMatrix));
                 return math.mul(parentWorldMatrix, new float4(localTranslationDelta, 0)).xyz;
             }
 

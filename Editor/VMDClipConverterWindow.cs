@@ -210,7 +210,7 @@ namespace UMT.Editor
             AnimationClip clip = AssetDatabase.LoadAssetAtPath<AnimationClip>(outputPath);
             if (clip == null)
             {
-                UnityEditorInternal.InternalEditorUtility.SaveToSerializedFileAndForget(new[] { generatedClip }, outputPath, false);
+                UnityEditorInternal.InternalEditorUtility.SaveToSerializedFileAndForget(new[] { generatedClip }, outputPath, true);
                 clip = generatedClip;
             }
             else

@@ -4,11 +4,12 @@ using Unity.Burst;
 using Unity.Collections;
 using Unity.Mathematics;
 using UnityEngine;
+using static UMT.PMXUtilities;
 
 namespace UMT
 {
     /// <summary>
-    /// Per-bone runtime data for the MMD transform solver: transform order, initial pose, constraints, IK, and solved transform state. Holds the blittable <see cref="BoneSolverData"/> used by the Burst-compiled solver.
+    /// Per-bone runtime data for the MMD transform solver: transform order, initial pose, constraints, IK, and solved transform state. Declares the blittable <see cref="BoneSolverConfig"/>/<see cref="BoneSolverState"/> pair used by the Burst-compiled solver.
     /// </summary>
     public sealed class MMDBoneTransform : MonoBehaviour
     {
@@ -46,12 +47,15 @@ namespace UMT
         public MMDBoneIKData ik = new MMDBoneIKData();
 
         /// <summary>
-        /// Blittable per-bone solver state used by the Burst-compiled MMD transform solver. Combines read-only initial/constraint data with mutable solved transform state.
+        /// Set by external pose resets (<see cref="RefreshInitialTransform"/>, physics reset); consumed by the transform manager on its next sample pass to clear this bone's solved state in the native solver cache.
         /// </summary>
-        public struct BoneSolverData
+        [NonSerialized] public bool solverResetPending = true;
+
+        /// <summary>
+        /// Blittable read-only per-bone solver configuration: initial pose, constraint setup, and hierarchy indices. Built once per model and shared by every solve pass.
+        /// </summary>
+        public struct BoneSolverConfig
         {
-            /// <summary>Original PMX bone name truncated to a fixed string.</summary>
-            public readonly FixedString32Bytes boneName;
             /// <summary>Initial bone position in model space.</summary>
             public readonly float3 initialModelPosition;
             /// <summary>Initial bone position relative to its parent.</summary>
@@ -79,6 +83,50 @@ namespace UMT
             public readonly bool rotatable;
             /// <summary>Index of the parent bone, or negative for a root bone.</summary>
             public readonly int parentBoneIndex;
+
+            /// <summary>
+            /// Initializes solver configuration from an <see cref="MMDBoneTransform"/> component.
+            /// </summary>
+            /// <param name="bone">Source bone component.</param>
+            public BoneSolverConfig(MMDBoneTransform bone) : this(bone.initialModelPosition, bone.initialLocalPosition, bone.initialLocalRotation, bone.constraintInfluence, bone.constraintTarget != null ? bone.constraintTarget.boneIndex : -1, bone.localConstraint, bone.rotationConstraint, bone.translationConstraint, bone.flags.HasFlag(PMXBone.Flags.Translatable), bone.flags.HasFlag(PMXBone.Flags.Rotatable), bone.parentBone != null ? bone.parentBone.boneIndex : -1)
+            {
+            }
+
+            /// <summary>
+            /// Initializes solver configuration from explicit initial and constraint values.
+            /// </summary>
+            /// <param name="initialModelPosition">Initial bone position in model space.</param>
+            /// <param name="initialLocalPosition">Initial bone position relative to its parent.</param>
+            /// <param name="initialLocalRotation">Initial bone rotation relative to its parent.</param>
+            /// <param name="constraintInfluence">Constraint influence weight; negative inverts the constraint.</param>
+            /// <param name="constraintTargetBoneIndex">Index of the constraint target bone, or negative when none.</param>
+            /// <param name="localConstraint">Whether the constraint reads the target's local transform.</param>
+            /// <param name="rotationConstraint">Whether this bone inherits rotation from its constraint target.</param>
+            /// <param name="translationConstraint">Whether this bone inherits translation from its constraint target.</param>
+            /// <param name="translatable">Whether this bone may be translated.</param>
+            /// <param name="rotatable">Whether this bone may be rotated.</param>
+            /// <param name="parentBoneIndex">Index of the parent bone, or negative for a root bone.</param>
+            public BoneSolverConfig(float3 initialModelPosition, float3 initialLocalPosition, quaternion initialLocalRotation, float constraintInfluence, int constraintTargetBoneIndex, bool localConstraint, bool rotationConstraint, bool translationConstraint, bool translatable, bool rotatable, int parentBoneIndex)
+            {
+                this.initialModelPosition = initialModelPosition;
+                this.initialLocalPosition = initialLocalPosition;
+                this.initialLocalRotation = initialLocalRotation;
+                this.constraintTargetBoneIndex = constraintTargetBoneIndex;
+                this.constraintInfluence = constraintInfluence;
+                this.localConstraint = localConstraint;
+                this.rotationConstraint = rotationConstraint;
+                this.translationConstraint = translationConstraint;
+                this.translatable = translatable;
+                this.rotatable = rotatable;
+                this.parentBoneIndex = parentBoneIndex;
+            }
+        };
+
+        /// <summary>
+        /// Blittable mutable per-bone solver state: the current local pose, constraint accumulators, IK rotation, world matrix, and solved transform, reset toward the initial pose each solve pass.
+        /// </summary>
+        public struct BoneSolverState
+        {
             /// <summary>Current local position before solving.</summary>
             public float3 localPosition;
             /// <summary>Current local rotation before solving.</summary>
@@ -89,9 +137,7 @@ namespace UMT
             public quaternion rotationConstraintValue;
             /// <summary>IK rotation delta applied on top of the local rotation.</summary>
             public quaternion ikRotation;
-            /// <summary>Local transform matrix derived from the solved local pose.</summary>
-            public float4x4 localMatrix;
-            /// <summary>World transform matrix derived from the parent world matrix and local matrix.</summary>
+            /// <summary>World transform matrix derived from the parent world matrix and the solved local pose.</summary>
             public float4x4 worldMatrix;
             /// <summary>Local position used as the IK-link base before applying IK rotation.</summary>
             public float3 localPositionForIKLink;
@@ -107,99 +153,38 @@ namespace UMT
             /// <summary>Whether the solved transform came from the IK solver.</summary>
             [MarshalAs(UnmanagedType.U1)]
             public bool solvedByIK;
+            /// <summary>Whether <see cref="worldMatrix"/> is already up to date for the current physics prepare pass; cleared at the start of each physics step and set only by the prepare pass so shared ancestor chains are computed once per step instead of once per rigid body.</summary>
+            [MarshalAs(UnmanagedType.U1)]
+            public bool worldMatrixValid;
 
             /// <summary>
-            /// Initializes solver data from an <see cref="MMDBoneTransform"/> component.
+            /// Creates a default solver state with identity rotations and world matrix, zero positions, and no solved transform.
             /// </summary>
-            /// <param name="bone">Source bone component.</param>
-            public BoneSolverData(MMDBoneTransform bone) : this(bone.boneName, bone.initialModelPosition, bone.initialLocalPosition, bone.initialLocalRotation, bone.constraintInfluence, bone.constraintTarget != null ? bone.constraintTarget.boneIndex : -1, bone.localConstraint, bone.rotationConstraint, bone.translationConstraint, bone.flags.HasFlag(PMXBone.Flags.Translatable), bone.flags.HasFlag(PMXBone.Flags.Rotatable), bone.parentBone != null ? bone.parentBone.boneIndex : -1)
+            /// <returns>A default-initialized <see cref="BoneSolverState"/>.</returns>
+            public static BoneSolverState CreateDefault()
             {
-            }
-
-            /// <summary>
-            /// Initializes solver data by copying the read-only initial/constraint fields of another instance, resetting all mutable solved state to defaults.
-            /// </summary>
-            /// <param name="other">Source solver data to copy read-only fields from.</param>
-            public BoneSolverData(BoneSolverData other) : this(other.boneName, other.initialModelPosition, other.initialLocalPosition, other.initialLocalRotation, other.constraintInfluence, other.constraintTargetBoneIndex, other.localConstraint, other.rotationConstraint, other.translationConstraint, other.translatable, other.rotatable, other.parentBoneIndex)
-            {
-            }
-
-            /// <summary>
-            /// Initializes solver data from explicit initial and constraint values, with all mutable solved state set to identity/zero defaults.
-            /// </summary>
-            /// <param name="boneName">Original PMX bone name truncated to a fixed string.</param>
-            /// <param name="initialModelPosition">Initial bone position in model space.</param>
-            /// <param name="initialLocalPosition">Initial bone position relative to its parent.</param>
-            /// <param name="initialLocalRotation">Initial bone rotation relative to its parent.</param>
-            /// <param name="constraintInfluence">Constraint influence weight; negative inverts the constraint.</param>
-            /// <param name="constraintTargetBoneIndex">Index of the constraint target bone, or negative when none.</param>
-            /// <param name="localConstraint">Whether the constraint reads the target's local transform.</param>
-            /// <param name="rotationConstraint">Whether this bone inherits rotation from its constraint target.</param>
-            /// <param name="translationConstraint">Whether this bone inherits translation from its constraint target.</param>
-            /// <param name="translatable">Whether this bone may be translated.</param>
-            /// <param name="rotatable">Whether this bone may be rotated.</param>
-            /// <param name="parentBoneIndex">Index of the parent bone, or negative for a root bone.</param>
-            public BoneSolverData(FixedString32Bytes boneName, float3 initialModelPosition, float3 initialLocalPosition, quaternion initialLocalRotation, float constraintInfluence, int constraintTargetBoneIndex, bool localConstraint, bool rotationConstraint, bool translationConstraint, bool translatable, bool rotatable, int parentBoneIndex)
-            {
-                this.boneName = boneName;
-                this.initialModelPosition = initialModelPosition;
-                this.initialLocalPosition = initialLocalPosition;
-                this.initialLocalRotation = initialLocalRotation;
-                this.constraintTargetBoneIndex = constraintTargetBoneIndex;
-                this.constraintInfluence = constraintInfluence;
-                this.localConstraint = localConstraint;
-                this.rotationConstraint = rotationConstraint;
-                this.translationConstraint = translationConstraint;
-                this.translatable = translatable;
-                this.rotatable = rotatable;
-                this.parentBoneIndex = parentBoneIndex;
-                localPosition = float3.zero;
-                localRotation = quaternion.identity;
-                translationConstraintValue = float3.zero;
-                rotationConstraintValue = quaternion.identity;
-                ikRotation = quaternion.identity;
-                localMatrix = float4x4.identity;
-                worldMatrix = float4x4.identity;
-                localPositionForIKLink = float3.zero;
-                localRotationForIKLink = quaternion.identity;
-                solvedLocalPosition = float3.zero;
-                solvedLocalRotation = quaternion.identity;
-                hasSolvedTransform = false;
-                solvedByIK = false;
-            }
-
-            /// <summary>
-            /// Creates a default, empty solver data instance with no constraint, no parent, and identity transforms.
-            /// </summary>
-            /// <returns>A default-initialized <see cref="BoneSolverData"/>.</returns>
-            public static BoneSolverData CreateDefault()
-            {
-                return new BoneSolverData("", float3.zero, float3.zero, quaternion.identity, 0f, -1, false, false, false, false, false, -1);
+                BoneSolverState state = default;
+                state.localRotation = quaternion.identity;
+                state.rotationConstraintValue = quaternion.identity;
+                state.ikRotation = quaternion.identity;
+                state.worldMatrix = float4x4.identity;
+                state.localRotationForIKLink = quaternion.identity;
+                state.solvedLocalRotation = quaternion.identity;
+                return state;
             }
         };
 
         /// <summary>
-        /// Current solver state for this bone, mirrored into the transform manager's native cache.
-        /// </summary>
-        [NonSerialized] public BoneSolverData runtimeData = BoneSolverData.CreateDefault();
-
-        /// <summary>
-        /// Captures the current Unity local transform as this bone's initial pose and re-seeds the runtime solver data so the local, IK-link, and solved transforms start from it.
+        /// Captures the current Unity local transform as this bone's initial pose and requests a solver reset so the native cache re-seeds from it on the next sample pass.
         /// </summary>
         public void RefreshInitialTransform()
         {
             initialLocalPosition = transform.localPosition;
             initialLocalRotation = transform.localRotation;
-            runtimeData = new BoneSolverData(this);
-            runtimeData.localPosition = initialLocalPosition;
-            runtimeData.localRotation = initialLocalRotation;
-            runtimeData.localPositionForIKLink = initialLocalPosition;
-            runtimeData.localRotationForIKLink = initialLocalRotation;
-            runtimeData.solvedLocalPosition = initialLocalPosition;
-            runtimeData.solvedLocalRotation = initialLocalRotation;
+            solverResetPending = true;
         }
 
-        
+
         /// <summary>
         /// Solves a bone's local and world matrices, applying constraints, then writes the result back into the solver context.
         /// </summary>
@@ -211,34 +196,36 @@ namespace UMT
         }
 
         /// <summary>
-        /// Recomputes a bone's local and world matrices from its sampled local transform without solving constraints, marking it as not yet solved.
+        /// Recomputes a bone's world matrix from its sampled local transform without solving constraints, marking it as not yet solved.
         /// </summary>
-        /// <param name="runtimeData">Bone solver data to update.</param>
+        /// <param name="config">Bone solver configuration.</param>
+        /// <param name="state">Bone solver state to update.</param>
         /// <param name="parentWorldMatrix">World matrix of the bone's parent.</param>
-        internal static void ObserveLocalMatrix(ref BoneSolverData runtimeData, in float4x4 parentWorldMatrix)
+        internal static void ObserveLocalMatrix(in BoneSolverConfig config, ref BoneSolverState state, in float4x4 parentWorldMatrix)
         {
-            BoneMath.ObserveLocalMatrixInternal(ref runtimeData, parentWorldMatrix);
+            BoneMath.ObserveLocalMatrixInternal(in config, ref state, parentWorldMatrix);
         }
 
         /// <summary>
-        /// Recomputes a bone's matrices from its IK-link base transform plus the current IK rotation, marking it solved by IK.
+        /// Recomputes a bone's world matrix from its IK-link base transform plus the current IK rotation, marking it solved by IK.
         /// </summary>
-        /// <param name="runtimeData">Bone solver data to update.</param>
+        /// <param name="state">Bone solver state to update.</param>
         /// <param name="parentWorldMatrix">World matrix of the bone's parent.</param>
-        internal static void UpdateLocalMatrixIKLink(ref BoneSolverData runtimeData, in float4x4 parentWorldMatrix)
+        internal static void UpdateLocalMatrixIKLink(ref BoneSolverState state, in float4x4 parentWorldMatrix)
         {
-            BoneMath.UpdateLocalMatrixIKLinkInternal(ref runtimeData, parentWorldMatrix);
+            BoneMath.UpdateLocalMatrixIKLinkInternal(ref state, parentWorldMatrix);
         }
 
         /// <summary>
-        /// Resets a bone's runtime data to the start of a solve pass, restoring either the initial pose (when the current transform matches the last solved transform) or the sampled transform.
+        /// Resets a bone's solver state to the start of a solve pass, restoring either the initial pose (when the current transform matches the last solved transform) or the sampled transform.
         /// </summary>
-        /// <param name="runtimeData">Bone solver data to reset.</param>
+        /// <param name="config">Bone solver configuration.</param>
+        /// <param name="state">Bone solver state to reset.</param>
         /// <param name="currentLocalPosition">Current sampled local position.</param>
         /// <param name="currentLocalRotation">Current sampled local rotation.</param>
-        internal static void ResetRuntimeData(ref BoneSolverData runtimeData, in float3 currentLocalPosition, in quaternion currentLocalRotation)
+        internal static void ResetRuntimeData(in BoneSolverConfig config, ref BoneSolverState state, in float3 currentLocalPosition, in quaternion currentLocalRotation)
         {
-            BoneMath.ResetRuntimeDataInternal(ref runtimeData, in currentLocalPosition, in currentLocalRotation);
+            BoneMath.ResetRuntimeDataInternal(in config, ref state, in currentLocalPosition, in currentLocalRotation);
         }
 
         /// <summary>
@@ -254,7 +241,7 @@ namespace UMT
         }
 
         /// <summary>
-        /// Directly applies a local position and rotation to a bone, recomputing its matrices and marking it solved (not by IK).
+        /// Directly applies a local position and rotation to a bone, recomputing its world matrix and marking it solved (not by IK).
         /// </summary>
         /// <param name="transformManagerContext">Solver context holding all bone solver data.</param>
         /// <param name="boneIndex">Index of the bone to update.</param>
@@ -269,116 +256,107 @@ namespace UMT
         private static class BoneMath
         {
             /// <summary>
-            /// Burst implementation that recomputes a bone's solved local/world matrices, applying any MMD rotation/translation constraint from its constraint target bone before composing the final transform.
+            /// Burst implementation that recomputes a bone's solved local pose and world matrix, applying any MMD rotation/translation constraint from its constraint target bone before composing the final transform.
             /// </summary>
             /// <param name="transformManagerContext">Solver context holding all bone solver data.</param>
             /// <param name="boneIndex">Index of the bone whose matrix is recomputed.</param>
             [BurstCompile]
             internal static void UpdateLocalMatrixInternal(ref MMDTransformManager.SolverContext transformManagerContext, int boneIndex)
             {
-                BoneSolverData input = transformManagerContext.boneSolverData[boneIndex];
-                BoneSolverData output = input;
-                BoneSolverData constraintRuntimeData = input.constraintTargetBoneIndex >= 0 ? transformManagerContext.boneSolverData[input.constraintTargetBoneIndex] : BoneSolverData.CreateDefault();
-                float3 nextPosition = input.localPosition;
-                quaternion nextRotation = input.localRotation;
-                float3 localPositionDelta = LocalPositionDelta(input.localPosition, input.initialLocalPosition);
-                quaternion localRotationDelta = LocalRotationDelta(input.localRotation, input.initialLocalRotation);
+                ref BoneSolverConfig config = ref ElementAt(transformManagerContext.boneConfigData, boneIndex);
+                ref BoneSolverState state = ref ElementAt(transformManagerContext.boneStateData, boneIndex);
+                float3 nextPosition = state.localPosition;
+                quaternion nextRotation = state.localRotation;
+                float3 localPositionDelta = LocalPositionDelta(state.localPosition, config.initialLocalPosition);
+                quaternion localRotationDelta = LocalRotationDelta(state.localRotation, config.initialLocalRotation);
+                float3 translationConstraintValue = localPositionDelta;
+                quaternion rotationConstraintValue = localRotationDelta;
 
-                if (input.constraintTargetBoneIndex != -1 && !Approximately(input.constraintInfluence, 0.0f) && transformManagerContext.solveConstraints)
+                if (config.constraintTargetBoneIndex != -1 && !Approximately(config.constraintInfluence, 0.0f) && transformManagerContext.solveConstraints)
                 {
-                    if (input.rotationConstraint)
+                    // Snapshot the constraint target by value before any writes so a degenerate self-targeting constraint still reads the pre-update values.
+                    BoneSolverState constraintState = config.constraintTargetBoneIndex >= 0 ? transformManagerContext.boneStateData[config.constraintTargetBoneIndex] : BoneSolverState.CreateDefault();
+                    float3 constraintInitialModelPosition = config.constraintTargetBoneIndex >= 0 ? transformManagerContext.boneConfigData[config.constraintTargetBoneIndex].initialModelPosition : float3.zero;
+                    if (config.rotationConstraint)
                     {
-                        quaternion sourceRotation = input.localConstraint ? ModelRotation(constraintRuntimeData.worldMatrix) : math.mul(constraintRuntimeData.rotationConstraintValue, constraintRuntimeData.ikRotation);
-                        quaternion weightedRotation = input.constraintInfluence >= 0.0f ? math.slerp(quaternion.identity, sourceRotation, input.constraintInfluence) : math.slerp(quaternion.identity, math.inverse(sourceRotation), -input.constraintInfluence);
+                        quaternion sourceRotation = config.localConstraint ? ModelRotation(constraintState.worldMatrix) : math.mul(constraintState.rotationConstraintValue, constraintState.ikRotation);
+                        quaternion weightedRotation = config.constraintInfluence >= 0.0f ? math.slerp(quaternion.identity, sourceRotation, config.constraintInfluence) : math.slerp(quaternion.identity, math.inverse(sourceRotation), -config.constraintInfluence);
                         nextRotation = math.mul(weightedRotation, nextRotation);
-                        output.rotationConstraintValue = math.mul(weightedRotation, localRotationDelta);
-                    }
-                    else
-                    {
-                        output.rotationConstraintValue = localRotationDelta;
+                        rotationConstraintValue = math.mul(weightedRotation, localRotationDelta);
                     }
 
-                    if (input.translationConstraint)
+                    if (config.translationConstraint)
                     {
-                        float3 sourceTranslation = input.localConstraint ? math.transform(constraintRuntimeData.worldMatrix, float3.zero)- constraintRuntimeData.initialModelPosition : constraintRuntimeData.translationConstraintValue;
-                        float3 weightedTranslation = sourceTranslation * input.constraintInfluence;
+                        float3 sourceTranslation = config.localConstraint ? math.transform(constraintState.worldMatrix, float3.zero)- constraintInitialModelPosition : constraintState.translationConstraintValue;
+                        float3 weightedTranslation = sourceTranslation * config.constraintInfluence;
                         nextPosition += weightedTranslation;
-                        output.translationConstraintValue = weightedTranslation + localPositionDelta;
+                        translationConstraintValue = weightedTranslation + localPositionDelta;
                     }
-                    else
-                    {
-                        output.translationConstraintValue = localPositionDelta;
-                    }
-                }
-                else
-                {
-                    output.rotationConstraintValue = localRotationDelta;
-                    output.translationConstraintValue = localPositionDelta;
                 }
 
-                output.localPositionForIKLink = nextPosition;
-                output.localRotationForIKLink = nextRotation;
-                output.solvedLocalPosition = nextPosition;
-                output.solvedLocalRotation = math.normalize(math.mul(nextRotation, input.ikRotation));
-                output.localMatrix = float4x4.TRS(nextPosition, output.solvedLocalRotation, new float3(1.0f, 1.0f, 1.0f));
                 GetParentWorldMatrixInternal(ref transformManagerContext, boneIndex, out float4x4 parentWorldMatrix);
-                output.worldMatrix = math.mul(parentWorldMatrix, output.localMatrix);
-                output.hasSolvedTransform = true;
-
-                transformManagerContext.boneSolverData[boneIndex] = output;
+                state.rotationConstraintValue = rotationConstraintValue;
+                state.translationConstraintValue = translationConstraintValue;
+                state.localPositionForIKLink = nextPosition;
+                state.localRotationForIKLink = nextRotation;
+                state.solvedLocalPosition = nextPosition;
+                state.solvedLocalRotation = math.normalize(math.mul(nextRotation, state.ikRotation));
+                float4x4 localMatrix = new float4x4(state.solvedLocalRotation, nextPosition);
+                state.worldMatrix = math.mul(parentWorldMatrix, localMatrix);
+                state.hasSolvedTransform = true;
             }
 
             /// <summary>
-            /// Burst implementation that resets a bone's solver data toward its initial pose, restoring the initial local transform when the sampled transform still matches the previously solved value.
+            /// Burst implementation that resets a bone's solver state toward its initial pose, restoring the initial local transform when the sampled transform still matches the previously solved value.
             /// </summary>
-            /// <param name="runtimeData">Bone solver data to reset, updated in place.</param>
+            /// <param name="config">Bone solver configuration.</param>
+            /// <param name="state">Bone solver state to reset, updated in place.</param>
             /// <param name="currentLocalPosition">Local position currently sampled from the Unity transform.</param>
             /// <param name="currentLocalRotation">Local rotation currently sampled from the Unity transform.</param>
             [BurstCompile]
-            internal static void ResetRuntimeDataInternal(ref BoneSolverData runtimeData, in float3 currentLocalPosition, in quaternion currentLocalRotation)
+            internal static void ResetRuntimeDataInternal(in BoneSolverConfig config, ref BoneSolverState state, in float3 currentLocalPosition, in quaternion currentLocalRotation)
             {
-                BoneSolverData previousRuntimeData = runtimeData;
-                bool currentSolvedTransform = IsCurrentSolvedTransform(previousRuntimeData.hasSolvedTransform, currentLocalPosition, currentLocalRotation, previousRuntimeData.solvedLocalPosition, previousRuntimeData.solvedLocalRotation);
-                runtimeData = new BoneSolverData(previousRuntimeData);
-                runtimeData.localPosition = currentSolvedTransform ? previousRuntimeData.initialLocalPosition : currentLocalPosition;
-                runtimeData.localRotation = currentSolvedTransform ? previousRuntimeData.initialLocalRotation : currentLocalRotation;
-                runtimeData.localMatrix = float4x4.TRS(runtimeData.localPosition, runtimeData.localRotation, new float3(1.0f, 1.0f, 1.0f));
-                runtimeData.localPositionForIKLink = runtimeData.localPosition;
-                runtimeData.localRotationForIKLink = runtimeData.localRotation;
+                bool currentSolvedTransform = IsCurrentSolvedTransform(state.hasSolvedTransform, currentLocalPosition, currentLocalRotation, state.solvedLocalPosition, state.solvedLocalRotation);
+                state = BoneSolverState.CreateDefault();
+                state.localPosition = currentSolvedTransform ? config.initialLocalPosition : currentLocalPosition;
+                state.localRotation = currentSolvedTransform ? config.initialLocalRotation : currentLocalRotation;
+                state.localPositionForIKLink = state.localPosition;
+                state.localRotationForIKLink = state.localRotation;
             }
 
             /// <summary>
-            /// Burst implementation that recomputes a bone's local/world matrices and constraint deltas from its current local transform without marking it solved (used to observe externally driven bones).
+            /// Burst implementation that recomputes a bone's world matrix and constraint deltas from its current local transform without marking it solved (used to observe externally driven bones).
             /// </summary>
-            /// <param name="runtimeData">Bone solver data to update in place.</param>
+            /// <param name="config">Bone solver configuration.</param>
+            /// <param name="state">Bone solver state to update in place.</param>
             /// <param name="parentWorldMatrix">World matrix of the bone's parent.</param>
             [BurstCompile]
-            internal static void ObserveLocalMatrixInternal(ref BoneSolverData runtimeData, in float4x4 parentWorldMatrix)
+            internal static void ObserveLocalMatrixInternal(in BoneSolverConfig config, ref BoneSolverState state, in float4x4 parentWorldMatrix)
             {
-                runtimeData.translationConstraintValue = LocalPositionDelta(runtimeData.localPosition, runtimeData.initialLocalPosition);
-                runtimeData.rotationConstraintValue = LocalRotationDelta(runtimeData.localRotation, runtimeData.initialLocalRotation);
-                runtimeData.localPositionForIKLink = runtimeData.localPosition;
-                runtimeData.localRotationForIKLink = runtimeData.localRotation;
-                runtimeData.localMatrix = float4x4.TRS(runtimeData.localPosition, runtimeData.localRotation, new float3(1.0f, 1.0f, 1.0f));
-                runtimeData.worldMatrix = math.mul(parentWorldMatrix, runtimeData.localMatrix);
-                runtimeData.hasSolvedTransform = false;
+                state.translationConstraintValue = LocalPositionDelta(state.localPosition, config.initialLocalPosition);
+                state.rotationConstraintValue = LocalRotationDelta(state.localRotation, config.initialLocalRotation);
+                state.localPositionForIKLink = state.localPosition;
+                state.localRotationForIKLink = state.localRotation;
+                float4x4 localMatrix = new float4x4(state.localRotation, state.localPosition);
+                state.worldMatrix = math.mul(parentWorldMatrix, localMatrix);
+                state.hasSolvedTransform = false;
             }
 
             /// <summary>
-            /// Burst implementation that rebuilds an IK link bone's matrices from its IK-link local transform and IK rotation, marking the bone as solved by IK.
+            /// Burst implementation that rebuilds an IK link bone's world matrix from its IK-link local transform and IK rotation, marking the bone as solved by IK.
             /// </summary>
-            /// <param name="runtimeData">Bone solver data to update in place.</param>
+            /// <param name="state">Bone solver state to update in place.</param>
             /// <param name="parentWorldMatrix">World matrix of the bone's parent.</param>
             [BurstCompile]
-            internal static void UpdateLocalMatrixIKLinkInternal(ref BoneSolverData runtimeData, in float4x4 parentWorldMatrix)
+            internal static void UpdateLocalMatrixIKLinkInternal(ref BoneSolverState state, in float4x4 parentWorldMatrix)
             {
-                quaternion nextRotation = math.normalize(math.mul(runtimeData.localRotationForIKLink, runtimeData.ikRotation));
-                runtimeData.localMatrix = float4x4.TRS(runtimeData.localPositionForIKLink, nextRotation, new float3(1.0f, 1.0f, 1.0f));
-                runtimeData.worldMatrix = math.mul(parentWorldMatrix, runtimeData.localMatrix);
-                runtimeData.solvedLocalPosition = runtimeData.localPositionForIKLink;
-                runtimeData.solvedLocalRotation = nextRotation;
-                runtimeData.hasSolvedTransform = true;
-                runtimeData.solvedByIK = true;
+                quaternion nextRotation = math.normalize(math.mul(state.localRotationForIKLink, state.ikRotation));
+                float4x4 localMatrix = new float4x4(nextRotation, state.localPositionForIKLink);
+                state.worldMatrix = math.mul(parentWorldMatrix, localMatrix);
+                state.solvedLocalPosition = state.localPositionForIKLink;
+                state.solvedLocalRotation = nextRotation;
+                state.hasSolvedTransform = true;
+                state.solvedByIK = true;
             }
 
             private static quaternion ModelRotation(float4x4 worldMatrix)
@@ -395,7 +373,7 @@ namespace UMT
             {
                 return math.normalize(math.mul(localRotation, math.inverse(initialLocalRotation)));
             }
-            
+
             private static bool IsCurrentSolvedTransform(bool hasSolvedTransform, float3 currentLocalPosition, quaternion currentLocalRotation, float3 solvedLocalPosition, quaternion solvedLocalRotation)
             {
                 return hasSolvedTransform &&
@@ -417,12 +395,12 @@ namespace UMT
             [BurstCompile]
             internal static void GetParentWorldMatrixInternal(ref MMDTransformManager.SolverContext transformManagerContext, int boneIndex, out float4x4 parentWorldMatrix)
             {
-                int parentBoneIndex = transformManagerContext.boneSolverData[boneIndex].parentBoneIndex;
-                parentWorldMatrix = parentBoneIndex >= 0 ? transformManagerContext.boneSolverData[parentBoneIndex].worldMatrix : transformManagerContext.rootParentWorldMatrix;
+                int parentBoneIndex = ElementAt(transformManagerContext.boneConfigData, boneIndex).parentBoneIndex;
+                parentWorldMatrix = parentBoneIndex >= 0 ? ElementAt(transformManagerContext.boneStateData, parentBoneIndex).worldMatrix : transformManagerContext.rootParentWorldMatrix;
             }
 
             /// <summary>
-            /// Burst implementation that writes a local position and rotation directly onto a bone, recomputing its matrices and marking it solved but not driven by IK.
+            /// Burst implementation that writes a local position and rotation directly onto a bone, recomputing its world matrix and marking it solved but not driven by IK.
             /// </summary>
             /// <param name="transformManagerContext">Solver context holding all bone solver data.</param>
             /// <param name="boneIndex">Index of the bone to update.</param>
@@ -431,19 +409,18 @@ namespace UMT
             [BurstCompile]
             internal static void ApplyLocalTransformToBoneInternal(ref MMDTransformManager.SolverContext transformManagerContext, int boneIndex, in float3 localPosition, in quaternion localRotation)
             {
-                MMDBoneTransform.BoneSolverData runtimeData = transformManagerContext.boneSolverData[boneIndex];
-                runtimeData.localPosition = localPosition;
-                runtimeData.localRotation = localRotation;
-                runtimeData.localPositionForIKLink = localPosition;
-                runtimeData.localRotationForIKLink = localRotation;
-                runtimeData.localMatrix = float4x4.TRS(localPosition, localRotation, new float3(1.0f, 1.0f, 1.0f));
                 GetParentWorldMatrixInternal(ref transformManagerContext, boneIndex, out float4x4 parentWorldMatrix);
-                runtimeData.worldMatrix = math.mul(parentWorldMatrix, runtimeData.localMatrix);
-                runtimeData.solvedLocalPosition = localPosition;
-                runtimeData.solvedLocalRotation = localRotation;
-                runtimeData.hasSolvedTransform = true;
-                runtimeData.solvedByIK = false;
-                transformManagerContext.boneSolverData[boneIndex] = runtimeData;
+                ref BoneSolverState state = ref ElementAt(transformManagerContext.boneStateData, boneIndex);
+                state.localPosition = localPosition;
+                state.localRotation = localRotation;
+                state.localPositionForIKLink = localPosition;
+                state.localRotationForIKLink = localRotation;
+                float4x4 localMatrix = new float4x4(localRotation, localPosition);
+                state.worldMatrix = math.mul(parentWorldMatrix, localMatrix);
+                state.solvedLocalPosition = localPosition;
+                state.solvedLocalRotation = localRotation;
+                state.hasSolvedTransform = true;
+                state.solvedByIK = false;
             }
         }
     }

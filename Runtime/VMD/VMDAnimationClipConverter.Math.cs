@@ -12,25 +12,25 @@ namespace UMT
     public static partial class VMDAnimationClipConverter
     {
 
-        private static NativeList<ResolvedBoneFrame> BuildSortedResolvedBoneFrames(VMDAnimation animation, ref IndexResolver resolver, in NativeArray<MMDBoneTransform.BoneSolverData> boneSolverData, int boneCount, int frameCount, Allocator allocator)
+        private static NativeList<ResolvedBoneFrame> BuildSortedResolvedBoneFrames(VMDAnimation animation, ref IndexResolver resolver, in NativeArray<MMDBoneTransform.BoneSolverConfig> boneConfigData, int boneCount, int frameCount, Allocator allocator)
         {
             NativeList<ResolvedBoneFrame> result = new NativeList<ResolvedBoneFrame>(animation.boneFrames.Length, allocator);
 
             for (int sourceOrder = 0; sourceOrder < animation.boneFrames.Length; ++sourceOrder)
             {
-                BuildResolvedBoneFrame(sourceOrder, ref result, animation, ref resolver, boneSolverData, boneCount, frameCount, allocator);
+                BuildResolvedBoneFrame(sourceOrder, ref result, animation, ref resolver, boneConfigData, boneCount, frameCount, allocator);
             }
             result.Sort();
             return result;
         }
 
-        private static async Task<NativeList<ResolvedBoneFrame>> BuildSortedResolvedBoneFramesAsync(UMTFrameBudget frameBudget, VMDAnimation animation, IndexResolver resolver, NativeArray<MMDBoneTransform.BoneSolverData> boneSolverData, int boneCount, int frameCount, Allocator allocator)
+        private static async Task<NativeList<ResolvedBoneFrame>> BuildSortedResolvedBoneFramesAsync(UMTFrameBudget frameBudget, VMDAnimation animation, IndexResolver resolver, NativeArray<MMDBoneTransform.BoneSolverConfig> boneConfigData, int boneCount, int frameCount, Allocator allocator)
         {
             NativeList<ResolvedBoneFrame> result = new NativeList<ResolvedBoneFrame>(animation.boneFrames.Length, allocator);
 
             for (int sourceOrder = 0; sourceOrder < animation.boneFrames.Length; ++sourceOrder)
             {
-                BuildResolvedBoneFrame(sourceOrder, ref result, animation, ref resolver, boneSolverData, boneCount, frameCount, allocator);
+                BuildResolvedBoneFrame(sourceOrder, ref result, animation, ref resolver, boneConfigData, boneCount, frameCount, allocator);
                 if (sourceOrder % 100 == 0)
                 {
                     await frameBudget.YieldIfNeeded();
@@ -49,7 +49,7 @@ namespace UMT
             return result;
         }
 
-        private static void BuildResolvedBoneFrame(int sourceOrder, ref NativeList<ResolvedBoneFrame> result, VMDAnimation animation, ref IndexResolver resolver, in NativeArray<MMDBoneTransform.BoneSolverData> boneSolverData, int boneCount, int frameCount, Allocator allocator)
+        private static void BuildResolvedBoneFrame(int sourceOrder, ref NativeList<ResolvedBoneFrame> result, VMDAnimation animation, ref IndexResolver resolver, in NativeArray<MMDBoneTransform.BoneSolverConfig> boneConfigData, int boneCount, int frameCount, Allocator allocator)
         {
             VMDBoneFrame frame = animation.boneFrames[sourceOrder];
             int boneIndex = resolver.ResolveBoneIndex(frame.boneName);
@@ -64,7 +64,7 @@ namespace UMT
                 return;
             }
 
-            result.Add(new ResolvedBoneFrame(boneIndex, frame.frame, sourceOrder, ToBoneSample(frame, boneSolverData[boneIndex].initialLocalPosition, boneSolverData[boneIndex].initialLocalRotation)));
+            result.Add(new ResolvedBoneFrame(boneIndex, frame.frame, sourceOrder, ToBoneSample(frame, boneConfigData[boneIndex].initialLocalPosition, boneConfigData[boneIndex].initialLocalRotation)));
         }
 
         private static NativeList<ResolvedIKToggleFrame> BuildSortedResolvedIKToggleFrames(VMDAnimation animation, ref IndexResolver resolver, in NativeArray<int> ikControllerByBoneIndex, int boneCount, int frameCount, Allocator allocator)
@@ -194,13 +194,13 @@ namespace UMT
             /// <summary>
             /// Fills every gap in each compact bone track by Bezier/slerp interpolation between surrounding keys, seeding frame 0 from the initial pose and recording the last keyed frame per bone.
             /// </summary>
-            /// <param name="boneSolverData">Per-bone solver data providing initial local transforms.</param>
+            /// <param name="boneConfigData">Per-bone solver configuration providing initial local transforms.</param>
             /// <param name="sourceBoneIndices">Bone indices that have source tracks.</param>
             /// <param name="boneSamples">Flattened (track, frame) sample buffer to fill in place.</param>
             /// <param name="frameCount">Number of frames per track.</param>
             /// <param name="lastFrameWithSampleByBone">Output last keyed frame index per bone.</param>
             [BurstCompile]
-            internal static void InterpolateCompactBoneSamples(in NativeArray<MMDBoneTransform.BoneSolverData> boneSolverData, in NativeList<int> sourceBoneIndices, ref NativeArray<BoneSample> boneSamples, int frameCount, ref NativeArray<int> lastFrameWithSampleByBone)
+            internal static void InterpolateCompactBoneSamples(in NativeArray<MMDBoneTransform.BoneSolverConfig> boneConfigData, in NativeList<int> sourceBoneIndices, ref NativeArray<BoneSample> boneSamples, int frameCount, ref NativeArray<int> lastFrameWithSampleByBone)
             {
                 for (int trackIndex = 0; trackIndex < sourceBoneIndices.Length; ++trackIndex)
                 {
@@ -208,7 +208,7 @@ namespace UMT
                     int sampleStartIndex = trackIndex * frameCount;
                     if (!boneSamples[sampleStartIndex].hasKey)
                     {
-                        boneSamples[sampleStartIndex] = new BoneSample(boneSolverData[boneIndex].initialLocalPosition, boneSolverData[boneIndex].initialLocalRotation, true);
+                        boneSamples[sampleStartIndex] = new BoneSample(boneConfigData[boneIndex].initialLocalPosition, boneConfigData[boneIndex].initialLocalRotation, true);
                     }
 
                     ApplyShortestRotationPath(ref boneSamples, sampleStartIndex, frameCount);
@@ -243,28 +243,28 @@ namespace UMT
             /// Asynchronously fills every gap in each compact bone track by Bezier/slerp interpolation between surrounding keys, seeding frame 0 from the initial pose and recording the last keyed frame per bone.
             /// </summary>
             /// <param name="frameBudget">Frame budget for yielding.</param>
-            /// <param name="boneSolverData">Per-bone solver data providing initial local transforms.</param>
+            /// <param name="boneConfigData">Per-bone solver configuration providing initial local transforms.</param>
             /// <param name="sourceBoneIndices">Bone indices that have source tracks.</param>
             /// <param name="boneSamples">Flattened (track, frame) sample buffer to fill in place.</param>
             /// <param name="frameCount">Number of frames per track.</param>
             /// <param name="lastFrameWithSampleByBone">Output last keyed frame index per bone.</param>
-            internal static async Task InterpolateCompactBoneSamplesAsync(UMTFrameBudget frameBudget, NativeArray<MMDBoneTransform.BoneSolverData> boneSolverData, NativeList<int> sourceBoneIndices, NativeArray<BoneSample> boneSamples, int frameCount, NativeArray<int> lastFrameWithSampleByBone)
+            internal static async Task InterpolateCompactBoneSamplesAsync(UMTFrameBudget frameBudget, NativeArray<MMDBoneTransform.BoneSolverConfig> boneConfigData, NativeList<int> sourceBoneIndices, NativeArray<BoneSample> boneSamples, int frameCount, NativeArray<int> lastFrameWithSampleByBone)
             {
                 for (int trackIndex = 0; trackIndex < sourceBoneIndices.Length; ++trackIndex)
                 {
-                    InterpolateCompactBoneSample(trackIndex, in boneSolverData, in sourceBoneIndices, ref boneSamples, frameCount, ref lastFrameWithSampleByBone);
+                    InterpolateCompactBoneSample(trackIndex, in boneConfigData, in sourceBoneIndices, ref boneSamples, frameCount, ref lastFrameWithSampleByBone);
                     await frameBudget.YieldIfNeeded();
                 }
             }
 
             [BurstCompile]
-            private static void InterpolateCompactBoneSample(int trackIndex, in NativeArray<MMDBoneTransform.BoneSolverData> boneSolverData, in NativeList<int> sourceBoneIndices, ref NativeArray<BoneSample> boneSamples, int frameCount, ref NativeArray<int> lastFrameWithSampleByBone)
+            private static void InterpolateCompactBoneSample(int trackIndex, in NativeArray<MMDBoneTransform.BoneSolverConfig> boneConfigData, in NativeList<int> sourceBoneIndices, ref NativeArray<BoneSample> boneSamples, int frameCount, ref NativeArray<int> lastFrameWithSampleByBone)
             {
                 int boneIndex = sourceBoneIndices[trackIndex];
                 int sampleStartIndex = trackIndex * frameCount;
                 if (!boneSamples[sampleStartIndex].hasKey)
                 {
-                    boneSamples[sampleStartIndex] = new BoneSample(boneSolverData[boneIndex].initialLocalPosition, boneSolverData[boneIndex].initialLocalRotation, true);
+                    boneSamples[sampleStartIndex] = new BoneSample(boneConfigData[boneIndex].initialLocalPosition, boneConfigData[boneIndex].initialLocalRotation, true);
                 }
 
                 ApplyShortestRotationPath(ref boneSamples, sampleStartIndex, frameCount);
@@ -374,7 +374,7 @@ namespace UMT
             /// <summary>
             /// Determines which bones need baked FK curves by seeding from source-animated, IK-controlled, and physics-controlled bones, then propagating along constraint and IK dependency edges. Extends each affected bone's last-sample frame so dependent curves cover the full range.
             /// </summary>
-            /// <param name="boneSolverData">Per-bone solver data describing constraints.</param>
+            /// <param name="boneConfigData">Per-bone solver configuration describing constraints.</param>
             /// <param name="sourceBoneSelection">Flags marking bones with source animation.</param>
             /// <param name="ikControllerByBoneIndex">Map from bone index to IK controller index (-1 if none).</param>
             /// <param name="ikControllers">IK controller data.</param>
@@ -387,7 +387,7 @@ namespace UMT
             /// <param name="lastFrame">Last animation frame index.</param>
             /// <param name="bakePhysics">Whether physics-controlled bones are included.</param>
             [BurstCompile]
-            internal static void ResolveBakedCurveBones(in NativeArray<MMDBoneTransform.BoneSolverData> boneSolverData, in NativeArray<bool> sourceBoneSelection, in NativeArray<int> ikControllerByBoneIndex, in NativeArray<MMDTransformManager.IKControllerData> ikControllers, in NativeArray<MMDTransformManager.IKLinkData> ikLinks, in NativeArray<bool> physicsControlledBones, ref NativeArray<bool> curveBoneSelection, ref NativeArray<int> lastFrameWithSampleByBone, ref NativeList<int> curveBoneIndices, int boneCount, int lastFrame, bool bakePhysics)
+            internal static void ResolveBakedCurveBones(in NativeArray<MMDBoneTransform.BoneSolverConfig> boneConfigData, in NativeArray<bool> sourceBoneSelection, in NativeArray<int> ikControllerByBoneIndex, in NativeArray<MMDTransformManager.IKControllerData> ikControllers, in NativeArray<MMDTransformManager.IKLinkData> ikLinks, in NativeArray<bool> physicsControlledBones, ref NativeArray<bool> curveBoneSelection, ref NativeArray<int> lastFrameWithSampleByBone, ref NativeList<int> curveBoneIndices, int boneCount, int lastFrame, bool bakePhysics)
             {
 
                 NativeArray<int> firstDependencyEdgeByBone = new NativeArray<int>(boneCount, Allocator.Persistent);
@@ -398,10 +398,10 @@ namespace UMT
                 dependencyEdges.Clear();
                 for (int boneIndex = 0; boneIndex < boneCount; ++boneIndex)
                 {
-                    MMDBoneTransform.BoneSolverData runtimeData = boneSolverData[boneIndex];
-                    if ((runtimeData.rotationConstraint || runtimeData.translationConstraint) && runtimeData.constraintTargetBoneIndex >= 0 && runtimeData.constraintTargetBoneIndex < boneCount)
+                    MMDBoneTransform.BoneSolverConfig config = boneConfigData[boneIndex];
+                    if ((config.rotationConstraint || config.translationConstraint) && config.constraintTargetBoneIndex >= 0 && config.constraintTargetBoneIndex < boneCount)
                     {
-                        AddSparseDependencyEdge(runtimeData.constraintTargetBoneIndex, boneIndex, ref firstDependencyEdgeByBone, ref dependencyEdges);
+                        AddSparseDependencyEdge(config.constraintTargetBoneIndex, boneIndex, ref firstDependencyEdgeByBone, ref dependencyEdges);
                     }
                 }
 
@@ -512,7 +512,8 @@ namespace UMT
             /// </summary>
             /// <param name="transformContext">Transform solver context to drive.</param>
             /// <param name="physicsContext">Physics solver context to advance.</param>
-            /// <param name="boneSolverData">Per-bone solver data updated in place.</param>
+            /// <param name="boneConfigData">Per-bone solver configuration providing initial transforms.</param>
+            /// <param name="boneStateData">Per-bone solver state updated in place.</param>
             /// <param name="ikControllers">IK controller data updated with this frame's enable states.</param>
             /// <param name="sourceTrackIndexByBone">Map from bone index to compact source track index.</param>
             /// <param name="physicsControlledBoneSelection">Flags marking physics-controlled bones.</param>
@@ -525,9 +526,9 @@ namespace UMT
             /// <param name="frameRate">Clip frame rate, used to derive the physics time step.</param>
             /// <param name="bakePhysics">Whether physics is simulated for this bake.</param>
             [BurstCompile]
-            internal static void TransformBonesForBakeFrame(ref MMDTransformManager.SolverContext transformContext, ref MMDPhysicsManager.PhysicsSolverContext physicsContext, ref NativeArray<MMDBoneTransform.BoneSolverData> boneSolverData, ref NativeArray<MMDTransformManager.IKControllerData> ikControllers, in NativeArray<int> sourceTrackIndexByBone, in NativeArray<bool> physicsControlledBoneSelection, in NativeArray<BoneSample> boneSamples, in NativeArray<int> ikControllerByBoneIndex, in NativeArray<int> ikTrackIndexByBone, in NativeArray<IKToggleFrameSample> ikSamplesByTrack, int frameCount, int frameIndex, float frameRate, bool bakePhysics)
+            internal static void TransformBonesForBakeFrame(ref MMDTransformManager.SolverContext transformContext, ref MMDPhysicsManager.PhysicsSolverContext physicsContext, in NativeArray<MMDBoneTransform.BoneSolverConfig> boneConfigData, ref NativeArray<MMDBoneTransform.BoneSolverState> boneStateData, ref NativeArray<MMDTransformManager.IKControllerData> ikControllers, in NativeArray<int> sourceTrackIndexByBone, in NativeArray<bool> physicsControlledBoneSelection, in NativeArray<BoneSample> boneSamples, in NativeArray<int> ikControllerByBoneIndex, in NativeArray<int> ikTrackIndexByBone, in NativeArray<IKToggleFrameSample> ikSamplesByTrack, int frameCount, int frameIndex, float frameRate, bool bakePhysics)
             {
-                ApplyCompactBoneSamples(ref boneSolverData, in sourceTrackIndexByBone, in physicsControlledBoneSelection, in boneSamples, frameCount, frameIndex, bakePhysics);
+                ApplyCompactBoneSamples(in boneConfigData, ref boneStateData, in sourceTrackIndexByBone, in physicsControlledBoneSelection, in boneSamples, frameCount, frameIndex, bakePhysics);
                 ApplyCompactIKSamples(ref ikControllers, in ikControllerByBoneIndex, in ikTrackIndexByBone, in ikSamplesByTrack, frameCount, frameIndex);
 
                 float elapsedTime = frameIndex == 0 ? 0.0f : 1.0f / frameRate;
@@ -537,14 +538,14 @@ namespace UMT
             /// <summary>
             /// Writes the solved local position and rotation of each curve bone into the baked keyframe buffers for one frame, skipping bones whose last sample frame has already passed.
             /// </summary>
-            /// <param name="boneSolverData">Per-bone solver data holding solved transforms.</param>
+            /// <param name="boneStateData">Per-bone solver state holding solved transforms.</param>
             /// <param name="curveBoneIndices">Bones that receive baked curves.</param>
             /// <param name="lastFrameWithSampleByBone">Per-bone last frame that should be keyed.</param>
             /// <param name="curveBuffers">Destination keyframe buffers.</param>
             /// <param name="frameIndex">The frame being written.</param>
             /// <param name="frameRate">Clip frame rate, used to compute keyframe time.</param>
             [BurstCompile]
-            internal static void WriteBakedBoneCurvesForFrame(in NativeArray<MMDBoneTransform.BoneSolverData> boneSolverData, in NativeList<int> curveBoneIndices, in NativeArray<int> lastFrameWithSampleByBone, ref BakedBoneCurveBuffers curveBuffers, int frameIndex, float frameRate)
+            internal static void WriteBakedBoneCurvesForFrame(in NativeArray<MMDBoneTransform.BoneSolverState> boneStateData, in NativeList<int> curveBoneIndices, in NativeArray<int> lastFrameWithSampleByBone, ref BakedBoneCurveBuffers curveBuffers, int frameIndex, float frameRate)
             {
                 float time = frameIndex / frameRate;
                 for (int curveBoneIndexIndex = 0; curveBoneIndexIndex < curveBoneIndices.Length; ++curveBoneIndexIndex)
@@ -555,9 +556,9 @@ namespace UMT
                         continue;
                     }
 
-                    MMDBoneTransform.BoneSolverData runtimeData = boneSolverData[boneIndex];
-                    float3 position = runtimeData.hasSolvedTransform ? runtimeData.solvedLocalPosition : runtimeData.localPosition;
-                    quaternion rotation = runtimeData.hasSolvedTransform ? runtimeData.solvedLocalRotation : runtimeData.localRotation;
+                    ref MMDBoneTransform.BoneSolverState state = ref PMXUtilities.ElementAt(boneStateData, boneIndex);
+                    float3 position = state.hasSolvedTransform ? state.solvedLocalPosition : state.localPosition;
+                    quaternion rotation = state.hasSolvedTransform ? state.solvedLocalRotation : state.localRotation;
                     int keyframeIndex = curveBuffers.keyframeStartByBone[boneIndex] + frameIndex;
                     curveBuffers.positionX[keyframeIndex] = new Keyframe(time, position.x);
                     curveBuffers.positionY[keyframeIndex] = new Keyframe(time, position.y);
@@ -572,7 +573,8 @@ namespace UMT
             /// <summary>
             /// Copies the frame's compact bone samples into the solver data as local transforms, falling back to the initial pose for untracked bones and optionally skipping physics-controlled bones.
             /// </summary>
-            /// <param name="boneSolverData">Per-bone solver data updated in place.</param>
+            /// <param name="boneConfigData">Per-bone solver configuration providing initial transforms.</param>
+            /// <param name="boneStateData">Per-bone solver state updated in place.</param>
             /// <param name="sourceTrackIndexByBone">Map from bone index to compact source track index.</param>
             /// <param name="physicsControlledBoneSelection">Flags marking physics-controlled bones.</param>
             /// <param name="boneSamples">Flattened (track, frame) bone sample buffer.</param>
@@ -580,23 +582,22 @@ namespace UMT
             /// <param name="frameIndex">The frame to apply.</param>
             /// <param name="skipPhysicsControlledBones">When true, physics-controlled bones are left untouched.</param>
             [BurstCompile]
-            internal static void ApplyCompactBoneSamples(ref NativeArray<MMDBoneTransform.BoneSolverData> boneSolverData, in NativeArray<int> sourceTrackIndexByBone, in NativeArray<bool> physicsControlledBoneSelection, in NativeArray<BoneSample> boneSamples, int frameCount, int frameIndex, bool skipPhysicsControlledBones)
+            internal static void ApplyCompactBoneSamples(in NativeArray<MMDBoneTransform.BoneSolverConfig> boneConfigData, ref NativeArray<MMDBoneTransform.BoneSolverState> boneStateData, in NativeArray<int> sourceTrackIndexByBone, in NativeArray<bool> physicsControlledBoneSelection, in NativeArray<BoneSample> boneSamples, int frameCount, int frameIndex, bool skipPhysicsControlledBones)
             {
-                for (int boneIndex = 0; boneIndex < boneSolverData.Length; ++boneIndex)
+                for (int boneIndex = 0; boneIndex < boneStateData.Length; ++boneIndex)
                 {
                     if (skipPhysicsControlledBones && boneIndex < physicsControlledBoneSelection.Length && physicsControlledBoneSelection[boneIndex])
                     {
                         continue;
                     }
 
-                    MMDBoneTransform.BoneSolverData boneData = boneSolverData[boneIndex];
+                    ref MMDBoneTransform.BoneSolverState state = ref PMXUtilities.ElementAt(boneStateData, boneIndex);
                     int trackIndex = boneIndex < sourceTrackIndexByBone.Length ? sourceTrackIndexByBone[boneIndex] : -1;
-                    BoneSample sample = trackIndex >= 0 ? boneSamples[trackIndex * frameCount + frameIndex] : new BoneSample(boneData.initialLocalPosition, boneData.initialLocalRotation);
-                    boneData.localPosition = sample.position;
-                    boneData.localRotation = sample.rotation;
-                    boneData.hasSolvedTransform = false;
-                    boneData.solvedByIK = false;
-                    boneSolverData[boneIndex] = boneData;
+                    BoneSample sample = trackIndex >= 0 ? boneSamples[trackIndex * frameCount + frameIndex] : new BoneSample(boneConfigData[boneIndex].initialLocalPosition, boneConfigData[boneIndex].initialLocalRotation);
+                    state.localPosition = sample.position;
+                    state.localRotation = sample.rotation;
+                    state.hasSolvedTransform = false;
+                    state.solvedByIK = false;
                 }
             }
 
@@ -630,7 +631,7 @@ namespace UMT
             /// <summary>
             /// Builds a combined sample buffer that prepends a setup ramp (interpolating from the initial pose to the first source frame, using the shortest rotation path) before the original bone samples.
             /// </summary>
-            /// <param name="boneSolverData">Per-bone solver data providing initial transforms.</param>
+            /// <param name="boneConfigData">Per-bone solver configuration providing initial transforms.</param>
             /// <param name="sourceBoneIndices">Bone indices that have source tracks.</param>
             /// <param name="sourceBoneSamples">Original bone samples to append after the setup ramp.</param>
             /// <param name="combinedBoneSamples">Output combined sample buffer (setup ramp plus source frames).</param>
@@ -638,7 +639,7 @@ namespace UMT
             /// <param name="setupFrameCount">Number of setup (warm-up) frames to prepend.</param>
             /// <param name="combinedFrameCount">Number of frames per track in the combined buffer.</param>
             [BurstCompile]
-            internal static void PrependSetupBoneSamples(in NativeArray<MMDBoneTransform.BoneSolverData> boneSolverData, in NativeList<int> sourceBoneIndices, in NativeArray<BoneSample> sourceBoneSamples, ref NativeArray<BoneSample> combinedBoneSamples, int sourceFrameCount, int setupFrameCount, int combinedFrameCount)
+            internal static void PrependSetupBoneSamples(in NativeArray<MMDBoneTransform.BoneSolverConfig> boneConfigData, in NativeList<int> sourceBoneIndices, in NativeArray<BoneSample> sourceBoneSamples, ref NativeArray<BoneSample> combinedBoneSamples, int sourceFrameCount, int setupFrameCount, int combinedFrameCount)
             {
                 for (int trackIndex = 0; trackIndex < sourceBoneIndices.Length; ++trackIndex)
                 {
@@ -646,8 +647,8 @@ namespace UMT
                     int sourceStart = trackIndex * sourceFrameCount;
                     int combinedStart = trackIndex * combinedFrameCount;
 
-                    float3 initialPosition = boneSolverData[boneIndex].initialLocalPosition;
-                    quaternion initialRotation = boneSolverData[boneIndex].initialLocalRotation;
+                    float3 initialPosition = boneConfigData[boneIndex].initialLocalPosition;
+                    quaternion initialRotation = boneConfigData[boneIndex].initialLocalRotation;
                     BoneSample frame0Sample = sourceBoneSamples[sourceStart + 0];
                     quaternion targetRotation = frame0Sample.rotation;
                     if (math.dot(initialRotation, targetRotation) < 0.0f)
@@ -1041,12 +1042,12 @@ namespace UMT
             /// <summary>
             /// Seeds frame 0 of each sparse bone track from the initial pose when unkeyed, then adjusts subsequent keyed rotations to follow the shortest rotation path. Used by the non-baked (sparse) curve path.
             /// </summary>
-            /// <param name="boneSolverData">Per-bone solver data providing initial transforms.</param>
+            /// <param name="boneConfigData">Per-bone solver configuration providing initial transforms.</param>
             /// <param name="sourceBoneIndices">Bone indices that have source tracks.</param>
             /// <param name="boneSamples">Flattened (track, frame) sample buffer modified in place.</param>
             /// <param name="frameCount">Number of frames per track.</param>
             [BurstCompile]
-            internal static void SeedAndFixSparseBoneSamples(in NativeArray<MMDBoneTransform.BoneSolverData> boneSolverData, in NativeList<int> sourceBoneIndices, ref NativeArray<BoneSample> boneSamples, int frameCount)
+            internal static void SeedAndFixSparseBoneSamples(in NativeArray<MMDBoneTransform.BoneSolverConfig> boneConfigData, in NativeList<int> sourceBoneIndices, ref NativeArray<BoneSample> boneSamples, int frameCount)
             {
                 for (int trackIndex = 0; trackIndex < sourceBoneIndices.Length; ++trackIndex)
                 {
@@ -1054,7 +1055,7 @@ namespace UMT
                     int sampleStartIndex = trackIndex * frameCount;
                     if (!boneSamples[sampleStartIndex].hasKey)
                     {
-                        boneSamples[sampleStartIndex] = new BoneSample(0, boneSolverData[boneIndex].initialLocalPosition, boneSolverData[boneIndex].initialLocalRotation, false);
+                        boneSamples[sampleStartIndex] = new BoneSample(0, boneConfigData[boneIndex].initialLocalPosition, boneConfigData[boneIndex].initialLocalRotation, false);
                     }
 
                     ApplyShortestRotationPath(ref boneSamples, sampleStartIndex, frameCount);

@@ -13,7 +13,7 @@ namespace UMT
             uint lastFrame = GetLastIKFrame(animation);
             int frameCount = checked((int)lastFrame + 1);
             ref NativeArray<int> ikControllerByBoneIndices = ref transformContext.ikControllerByBoneIndices;
-            int boneCount = transformContext.boneSolverData.Length;
+            int boneCount = transformContext.boneConfigData.Length;
 
             NativeList<ResolvedIKToggleFrame> resolvedIKToggleFrames = BuildSortedResolvedIKToggleFrames(animation, ref resolver, in ikControllerByBoneIndices, boneCount, frameCount, Allocator.Persistent);
             NativeList<int> ikBoneIndices = new NativeList<int>(Allocator.Persistent);

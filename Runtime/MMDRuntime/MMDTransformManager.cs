@@ -4,6 +4,7 @@ using Unity.Collections;
 using Unity.Jobs;
 using Unity.Mathematics;
 using UnityEngine;
+using UnityEngine.Jobs;
 using UnityEngine.Rendering;
 using System.Runtime.InteropServices;
 using static UMT.PMXUtilities;
@@ -68,6 +69,47 @@ namespace UMT
         /// <summary>Frame the SDEF skinners last dispatched on, to dispatch once per frame across cameras.</summary>
         private int m_LastSDEFDispatchFrame = -1;
 
+        private const int k_TransformJobBatchCount = 64;
+        /// <summary>Transform access array over <see cref="bones"/> driving the sample/flush transform jobs, rebuilt with the native caches.</summary>
+        private TransformAccessArray m_BoneTransformAccess;
+
+        /// <summary>
+        /// Samples every bone's local position and rotation into the solver's sampled-transform buffers.
+        /// </summary>
+        [BurstCompile]
+        private struct SampleBoneTransformsJob : IJobParallelForTransform
+        {
+            /// <summary>Receives each bone's sampled local position.</summary>
+            [WriteOnly] internal NativeArray<float3> sampledLocalPositions;
+            /// <summary>Receives each bone's sampled local rotation.</summary>
+            [WriteOnly] internal NativeArray<quaternion> sampledLocalRotations;
+
+            public void Execute(int index, TransformAccess boneTransform)
+            {
+                boneTransform.GetLocalPositionAndRotation(out Vector3 localPosition, out Quaternion localRotation);
+                sampledLocalPositions[index] = localPosition;
+                sampledLocalRotations[index] = localRotation;
+            }
+        }
+
+        /// <summary>
+        /// Writes every bone's solved (or reset) local transform back onto its Unity transform.
+        /// </summary>
+        [BurstCompile]
+        private struct FlushBoneTransformsJob : IJobParallelForTransform
+        {
+            /// <summary>Per-bone solver state holding the transforms to flush.</summary>
+            [ReadOnly] internal NativeArray<MMDBoneTransform.BoneSolverState> boneStateData;
+
+            public void Execute(int index, TransformAccess boneTransform)
+            {
+                MMDBoneTransform.BoneSolverState state = boneStateData[index];
+                float3 localPosition = state.hasSolvedTransform ? state.solvedLocalPosition : state.localPosition;
+                quaternion localRotation = state.hasSolvedTransform ? state.solvedLocalRotation : state.localRotation;
+                boneTransform.SetLocalPositionAndRotation(localPosition, localRotation);
+            }
+        }
+
         /// <summary>
         /// Native per-controller IK data: controller and target bone indices, the link range, and iteration/angle settings.
         /// </summary>
@@ -115,8 +157,10 @@ namespace UMT
         /// </summary>
         internal struct SolverContext
         {
-            /// <summary>Per-bone solver data for every bone.</summary>
-            internal NativeArray<MMDBoneTransform.BoneSolverData> boneSolverData;
+            /// <summary>Per-bone read-only solver configuration for every bone.</summary>
+            internal NativeArray<MMDBoneTransform.BoneSolverConfig> boneConfigData;
+            /// <summary>Per-bone mutable solver state for every bone.</summary>
+            internal NativeArray<MMDBoneTransform.BoneSolverState> boneStateData;
             /// <summary>Sampled local positions captured from Unity transforms.</summary>
             internal NativeArray<float3> sampledLocalPositions;
             /// <summary>Sampled local rotations captured from Unity transforms.</summary>
@@ -159,19 +203,19 @@ namespace UMT
                 InitializePhysics();
             }
 
-            // SDEF skinning must overwrite the renderer's GPU vertex buffer AFTER Unity's own skinning, which runs in PostLateUpdate (after LateUpdate). Camera-render callbacks fire later still, so the compute dispatch is scheduled there to win over Unity's skinned result. Subscribe to both the SRP event and the built-in pipeline callback; only the active pipeline's event fires.
-            RenderPipelineManager.beginCameraRendering += OnBeginCameraRendering;
+            // Edit-mode SDEF skinning must overwrite the renderer's GPU vertex buffer AFTER Unity's own skinning, which runs in PostLateUpdate (after LateUpdate). Camera-render callbacks fire later still, so the edit-mode compute dispatch is scheduled there to win over Unity's skinned result. Subscribe to both the SRP event and the built-in pipeline callback; only the active pipeline's event fires. Play mode instead dispatches from LateUpdate into the pass-through mesh (see ReconcileSDEFSkinners) and does not use these callbacks.
+            RenderPipelineManager.beginContextRendering += OnBeginContextRendering;
             Camera.onPreRender += OnCameraPreRender;
         }
 
         private void OnDisable()
         {
-            RenderPipelineManager.beginCameraRendering -= OnBeginCameraRendering;
+            RenderPipelineManager.beginContextRendering -= OnBeginContextRendering;
             Camera.onPreRender -= OnCameraPreRender;
             DisposeRuntimeData();
         }
 
-        private void OnBeginCameraRendering(ScriptableRenderContext context, Camera camera)
+        private void OnBeginContextRendering(ScriptableRenderContext context, List<Camera> cameras)
         {
             DispatchSDEFSkinnersForFrame();
         }
@@ -191,15 +235,19 @@ namespace UMT
         }
 
         /// <summary>
-        /// Dispatches the GPU SDEF skinners once per rendered frame, gated by the same solve conditions as the transform pass. Invoked from whichever render pipeline's pre-render callback is active. No-op in CPU mode.
+        /// Dispatches the edit-mode GPU SDEF skinners once per rendered frame. In play mode the GPU path dispatches from LateUpdate through the pass-through mesh instead (see <see cref="ReconcileSDEFSkinners"/>), so this camera-driven path only serves edit-mode solving, where the compute dispatch must run after Unity's own skinning to overwrite the renderer's output buffer. No-op in CPU mode.
         /// </summary>
         private void DispatchSDEFSkinnersForFrame()
         {
+            if (Application.isPlaying)
+            {
+                return;
+            }
             if (EffectiveSDEFMode() != SDEFSkinningMode.GPU)
             {
                 return;
             }
-            if (!solveInEditMode && !Application.isPlaying)
+            if (!solveInEditMode)
             {
                 return;
             }
@@ -330,7 +378,7 @@ namespace UMT
 
         private bool ShouldRunLivePhysics()
         {
-            return Application.isPlaying && physicsManager != null && livePhysics;
+            return Application.isPlaying && transformEnabled && physicsManager != null && livePhysics;
         }
 
         /// <summary>
@@ -401,7 +449,7 @@ namespace UMT
         }
 
         /// <summary>
-        /// Runs CPU SDEF skinning when it is the effective mode in play mode; otherwise restores any renderer left on its CPU runtime pass-through mesh. Invoked at the end of the bone solve so toggling SDEF or the mode at runtime takes effect immediately.
+        /// Runs the play-mode SDEF skinning path at the end of the bone solve (even when the transform solve is disabled) so it tracks live bone poses: CPU jobs or the pass-through-mesh GPU dispatch, both of which must run before Unity's skinning consumes the mesh in PostLateUpdate. When skinning is off or in edit mode, restores any renderer left on its runtime pass-through mesh so toggling SDEF or the mode at runtime takes effect immediately.
         /// </summary>
         private void ReconcileSDEFSkinners()
         {
@@ -410,13 +458,26 @@ namespace UMT
                 return;
             }
 
-            if (doSDEFSkinning && Application.isPlaying && EffectiveSDEFMode() == SDEFSkinningMode.CPU)
+            if (doSDEFSkinning && Application.isPlaying)
             {
-                RunCPUSDEFSkinners();
+                if (EffectiveSDEFMode() == SDEFSkinningMode.CPU)
+                {
+                    RunCPUSDEFSkinners();
+                    return;
+                }
+
+                for (int i = 0; i < sdefSkinners.Length; ++i)
+                {
+                    MMDSDEFSkinner skinner = sdefSkinners[i];
+                    if (skinner != null)
+                    {
+                        skinner.DispatchPlayMode(sdefComputeShader);
+                    }
+                }
                 return;
             }
 
-            // CPU skinning should not run this frame; restore any renderer still on its CPU runtime mesh so the original mesh and bones are shown.
+            // Skinning should not run this frame; restore any renderer still on its runtime pass-through mesh so the original mesh and bones are shown.
             for (int i = 0; i < sdefSkinners.Length; ++i)
             {
                 MMDSDEFSkinner skinner = sdefSkinners[i];
@@ -439,7 +500,7 @@ namespace UMT
                 MMDSDEFSkinner skinner = sdefSkinners[i];
                 if (skinner != null)
                 {
-                    handles[scheduledCount] = skinner.CpuScheduleJob();
+                    handles[scheduledCount] = skinner.CPUScheduleJob();
                     ++scheduledCount;
                 }
             }
@@ -452,7 +513,7 @@ namespace UMT
                 MMDSDEFSkinner skinner = sdefSkinners[i];
                 if (skinner != null)
                 {
-                    skinner.CpuApply();
+                    skinner.CPUApply();
                 }
             }
         }
@@ -492,23 +553,21 @@ namespace UMT
 
         private void SampleBoneTransforms()
         {
+            // Read-only scheduling parallelizes the sampling across bones even within one hierarchy root; the pending-reset scan below touches component fields and the solver state array, which the job does not access, so it overlaps the job legally.
+            JobHandle sampleHandle = new SampleBoneTransformsJob { sampledLocalPositions = m_RuntimeContext.sampledLocalPositions, sampledLocalRotations = m_RuntimeContext.sampledLocalRotations, }.ScheduleReadOnly(m_BoneTransformAccess, k_TransformJobBatchCount);
+
             for (int i = 0; i < bones.Length; ++i)
             {
-                Vector3 localPosition;
-                Quaternion localRotation;
-                bones[i].transform.GetLocalPositionAndRotation(out localPosition, out localRotation);
-                m_RuntimeContext.sampledLocalPositions[i] = localPosition;
-                m_RuntimeContext.sampledLocalRotations[i] = localRotation;
-
-                MMDBoneTransform.BoneSolverData componentRuntimeData = bones[i].runtimeData;
-                if (!componentRuntimeData.hasSolvedTransform)
+                if (bones[i].solverResetPending)
                 {
-                    MMDBoneTransform.BoneSolverData runtimeData = m_RuntimeContext.boneSolverData[i];
-                    runtimeData.hasSolvedTransform = false;
-                    runtimeData.solvedByIK = false;
-                    m_RuntimeContext.boneSolverData[i] = runtimeData;
+                    bones[i].solverResetPending = false;
+                    ref MMDBoneTransform.BoneSolverState state = ref ElementAt(m_RuntimeContext.boneStateData, i);
+                    state.hasSolvedTransform = false;
+                    state.solvedByIK = false;
                 }
             }
+
+            sampleHandle.Complete();
         }
 
         private void ResetTransforms()
@@ -518,14 +577,7 @@ namespace UMT
 
         private void FlushBoneTransforms()
         {
-            for (int i = 0; i < bones.Length; ++i)
-            {
-                MMDBoneTransform.BoneSolverData runtimeData = m_RuntimeContext.boneSolverData[i];
-                float3 localPosition = runtimeData.hasSolvedTransform ? runtimeData.solvedLocalPosition : runtimeData.localPosition;
-                quaternion localRotation = runtimeData.hasSolvedTransform ? runtimeData.solvedLocalRotation : runtimeData.localRotation;
-                bones[i].transform.SetLocalPositionAndRotation(localPosition, localRotation);
-                bones[i].runtimeData = runtimeData;
-            }
+            new FlushBoneTransformsJob { boneStateData = m_RuntimeContext.boneStateData, }.Schedule(m_BoneTransformAccess).Complete();
         }
 
         /// <summary>
@@ -565,7 +617,8 @@ namespace UMT
                 }
             }
 
-            ResizePersistent(ref m_RuntimeContext.boneSolverData, bones.Length);
+            ResizePersistent(ref m_RuntimeContext.boneConfigData, bones.Length);
+            ResizePersistent(ref m_RuntimeContext.boneStateData, bones.Length);
             ResizePersistent(ref m_RuntimeContext.sampledLocalPositions, bones.Length);
             ResizePersistent(ref m_RuntimeContext.sampledLocalRotations, bones.Length);
             ResizePersistent(ref m_RuntimeContext.prePhysicsBoneIndices, prePhysicsBones.Length);
@@ -574,10 +627,18 @@ namespace UMT
             ResizePersistent(ref m_RuntimeContext.ikControllers, ikControllerCount);
             ResizePersistent(ref m_RuntimeContext.ikLinks, ikLinkCount);
 
+            if (m_BoneTransformAccess.isCreated)
+            {
+                m_BoneTransformAccess.Dispose();
+            }
+            m_BoneTransformAccess = new TransformAccessArray(bones.Length);
+
             for (int i = 0; i < bones.Length; ++i)
             {
                 MMDBoneTransform bone = bones[i];
-                m_RuntimeContext.boneSolverData[i] = new MMDBoneTransform.BoneSolverData(bone);
+                m_BoneTransformAccess.Add(bone.transform);
+                m_RuntimeContext.boneConfigData[i] = new MMDBoneTransform.BoneSolverConfig(bone);
+                m_RuntimeContext.boneStateData[i] = MMDBoneTransform.BoneSolverState.CreateDefault();
                 m_RuntimeContext.ikControllerByBoneIndices[i] = -1;
             }
 
@@ -657,7 +718,8 @@ namespace UMT
                 }
             }
 
-            ResizePersistent(ref runtimeContext.boneSolverData, model.bones.Length);
+            ResizePersistent(ref runtimeContext.boneConfigData, model.bones.Length);
+            ResizePersistent(ref runtimeContext.boneStateData, model.bones.Length);
             ResizePersistent(ref runtimeContext.sampledLocalPositions, model.bones.Length);
             ResizePersistent(ref runtimeContext.sampledLocalRotations, model.bones.Length);
             ResizePersistent(ref runtimeContext.prePhysicsBoneIndices, prePhysicsIndices.Length);
@@ -670,16 +732,12 @@ namespace UMT
             {
                 PMXBone bone = model.bones[i];
                 float3 initialLocalPosition = bone.parentBoneIndex >= 0 ? bone.position - model.bones[bone.parentBoneIndex].position : bone.position;
-                FixedString32Bytes boneName = default;
-                boneName.CopyFromTruncated(bone.originalName);
-                MMDBoneTransform.BoneSolverData runtimeData = new MMDBoneTransform.BoneSolverData(boneName, bone.position, initialLocalPosition, quaternion.identity, bone.constraintInfluence, bone.constraintTargetIndex, (bone.flags & PMXBone.Flags.LocalConstraint) != 0, (bone.flags & PMXBone.Flags.RotationConstraint) != 0, (bone.flags & PMXBone.Flags.TranslationConstraint) != 0, (bone.flags & PMXBone.Flags.Translatable) != 0, (bone.flags & PMXBone.Flags.Rotatable) != 0, bone.parentBoneIndex);
-                runtimeData.localPosition = initialLocalPosition;
-                runtimeData.localRotation = quaternion.identity;
-                runtimeData.localPositionForIKLink = initialLocalPosition;
-                runtimeData.localRotationForIKLink = quaternion.identity;
-                runtimeData.solvedLocalPosition = initialLocalPosition;
-                runtimeData.solvedLocalRotation = quaternion.identity;
-                runtimeContext.boneSolverData[i] = runtimeData;
+                runtimeContext.boneConfigData[i] = new MMDBoneTransform.BoneSolverConfig(bone.position, initialLocalPosition, quaternion.identity, bone.constraintInfluence, bone.constraintTargetIndex, (bone.flags & PMXBone.Flags.LocalConstraint) != 0, (bone.flags & PMXBone.Flags.RotationConstraint) != 0, (bone.flags & PMXBone.Flags.TranslationConstraint) != 0, (bone.flags & PMXBone.Flags.Translatable) != 0, (bone.flags & PMXBone.Flags.Rotatable) != 0, bone.parentBoneIndex);
+                MMDBoneTransform.BoneSolverState state = MMDBoneTransform.BoneSolverState.CreateDefault();
+                state.localPosition = initialLocalPosition;
+                state.localPositionForIKLink = initialLocalPosition;
+                state.solvedLocalPosition = initialLocalPosition;
+                runtimeContext.boneStateData[i] = state;
                 runtimeContext.sampledLocalPositions[i] = initialLocalPosition;
                 runtimeContext.sampledLocalRotations[i] = quaternion.identity;
                 runtimeContext.ikControllerByBoneIndices[i] = -1;
@@ -756,7 +814,8 @@ namespace UMT
         /// <param name="runtimeContext">Solver context to dispose.</param>
         internal static void DisposeSolverContext(ref SolverContext runtimeContext)
         {
-            DisposeNativeArray(ref runtimeContext.boneSolverData);
+            DisposeNativeArray(ref runtimeContext.boneConfigData);
+            DisposeNativeArray(ref runtimeContext.boneStateData);
             DisposeNativeArray(ref runtimeContext.sampledLocalPositions);
             DisposeNativeArray(ref runtimeContext.sampledLocalRotations);
             DisposeNativeArray(ref runtimeContext.prePhysicsBoneIndices);
@@ -769,7 +828,13 @@ namespace UMT
 
         private void DisposeNativeCaches()
         {
-            DisposeNativeArray(ref m_RuntimeContext.boneSolverData);
+            if (m_BoneTransformAccess.isCreated)
+            {
+                m_BoneTransformAccess.Dispose();
+            }
+
+            DisposeNativeArray(ref m_RuntimeContext.boneConfigData);
+            DisposeNativeArray(ref m_RuntimeContext.boneStateData);
             DisposeNativeArray(ref m_RuntimeContext.sampledLocalPositions);
             DisposeNativeArray(ref m_RuntimeContext.sampledLocalRotations);
             DisposeNativeArray(ref m_RuntimeContext.prePhysicsBoneIndices);
@@ -855,36 +920,29 @@ namespace UMT
                     transformBoneIndices = ref runtimeContext.afterPhysicsBoneIndices;
                 }
 
-                ref NativeArray<MMDBoneTransform.BoneSolverData> boneSolverDataArray = ref runtimeContext.boneSolverData;
-                ref NativeArray<IKControllerData> ikControllers = ref runtimeContext.ikControllers;
-                ref NativeArray<IKLinkData> ikLinks = ref runtimeContext.ikLinks;
-                ref NativeArray<int> ikControllerByBoneIndices = ref runtimeContext.ikControllerByBoneIndices;
-                float4x4 rootParentWorldMatrix = runtimeContext.rootParentWorldMatrix;
-
                 for (int i = 0; i < transformBoneIndices.Length; ++i)
                 {
                     int boneIndex = transformBoneIndices[i];
-                    MMDBoneTransform.BoneSolverData runtimeData = boneSolverDataArray[boneIndex];
-                    if (!runtimeData.hasSolvedTransform)
+                    ref MMDBoneTransform.BoneSolverState state = ref ElementAt(runtimeContext.boneStateData, boneIndex);
+                    if (!state.hasSolvedTransform)
                     {
                         // Clear any IK rotation carried from the previous frame as this bone's pose is (re)established from FK for the current frame.
-                        runtimeData.ikRotation = quaternion.identity;
-                        boneSolverDataArray[boneIndex] = runtimeData;
-                        if ((runtimeData.rotationConstraint || runtimeData.translationConstraint) && runtimeContext.solveConstraints)
+                        state.ikRotation = quaternion.identity;
+                        ref MMDBoneTransform.BoneSolverConfig config = ref ElementAt(runtimeContext.boneConfigData, boneIndex);
+                        if ((config.rotationConstraint || config.translationConstraint) && runtimeContext.solveConstraints)
                         {
                             MMDBoneTransform.UpdateLocalMatrix(ref runtimeContext, boneIndex);
                         }
                         else
                         {
                             float4x4 parentWorldMatrix = MMDBoneTransform.GetParentWorldMatrix(ref runtimeContext, boneIndex);
-                            MMDBoneTransform.ObserveLocalMatrix(ref runtimeData, parentWorldMatrix);
-                            boneSolverDataArray[boneIndex] = runtimeData;
+                            MMDBoneTransform.ObserveLocalMatrix(in config, ref state, parentWorldMatrix);
                         }
                     }
 
                     if (runtimeContext.solveIK)
                     {
-                        int ikControllerIndex = ikControllerByBoneIndices[boneIndex];
+                        int ikControllerIndex = runtimeContext.ikControllerByBoneIndices[boneIndex];
                         if (ikControllerIndex >= 0)
                         {
                             TransformIK(ref runtimeContext, ikControllerIndex);
@@ -900,21 +958,17 @@ namespace UMT
             [BurstCompile]
             internal static void ResetTransformsInternal(ref SolverContext runtimeContext)
             {
-                for (int i = 0; i < runtimeContext.boneSolverData.Length; ++i)
+                for (int i = 0; i < runtimeContext.boneStateData.Length; ++i)
                 {
-                    MMDBoneTransform.BoneSolverData runtimeData = runtimeContext.boneSolverData[i];
-                    MMDBoneTransform.ResetRuntimeData(ref runtimeData, runtimeContext.sampledLocalPositions[i], runtimeContext.sampledLocalRotations[i]);
-                    runtimeContext.boneSolverData[i] = runtimeData;
+                    ref MMDBoneTransform.BoneSolverConfig config = ref ElementAt(runtimeContext.boneConfigData, i);
+                    ref MMDBoneTransform.BoneSolverState state = ref ElementAt(runtimeContext.boneStateData, i);
+                    MMDBoneTransform.ResetRuntimeData(in config, ref state, runtimeContext.sampledLocalPositions[i], runtimeContext.sampledLocalRotations[i]);
                 }
             }
 
             private static void TransformIK(ref SolverContext runtimeContext, int ikControllerIndex)
             {
-                ref NativeArray<MMDBoneTransform.BoneSolverData> boneSolverDataArray = ref runtimeContext.boneSolverData;
-                ref NativeArray<IKControllerData> ikControllers = ref runtimeContext.ikControllers;
-                ref NativeArray<IKLinkData> ikLinks = ref runtimeContext.ikLinks;
-
-                IKControllerData controller = ikControllers[ikControllerIndex];
+                IKControllerData controller = runtimeContext.ikControllers[ikControllerIndex];
                 if (!controller.enabled || controller.targetBoneIndex < 0)
                 {
                     return;
@@ -922,24 +976,19 @@ namespace UMT
 
                 for (int i = 0; i < controller.linkCount; ++i)
                 {
-                    IKLinkData link = ikLinks[controller.linkStartIndex + i];
-                    MMDBoneTransform.BoneSolverData linkRuntimeData = boneSolverDataArray[link.boneIndex];
-                    linkRuntimeData.ikRotation = quaternion.identity;
-                    boneSolverDataArray[link.boneIndex] = linkRuntimeData;
+                    IKLinkData link = runtimeContext.ikLinks[controller.linkStartIndex + i];
+                    ElementAt(runtimeContext.boneStateData, link.boneIndex).ikRotation = quaternion.identity;
                 }
 
-                MMDBoneTransform.BoneSolverData controllerRuntimeData = boneSolverDataArray[controller.controllerBoneIndex];
-                float3 goalPosition = ModelPosition(in controllerRuntimeData);
+                float3 goalPosition = ModelPosition(ref runtimeContext, controller.controllerBoneIndex);
                 MMDBoneTransform.UpdateLocalMatrix(ref runtimeContext, controller.targetBoneIndex);
-                MMDBoneTransform.BoneSolverData targetRuntimeData = boneSolverDataArray[controller.targetBoneIndex];
-                float3 effectorPosition = ModelPosition(in targetRuntimeData);
-                if (math.lengthsq(goalPosition - effectorPosition) <= 0.00000001f)
+                float3 effectorPosition = ModelPosition(ref runtimeContext, controller.targetBoneIndex);
+                if (math.lengthsq(goalPosition - effectorPosition) <= math.EPSILON)
                 {
                     return;
                 }
                 RecalculateBaseIKChain(ref runtimeContext, in controller, controller.linkCount - 1);
-                targetRuntimeData = boneSolverDataArray[controller.targetBoneIndex];
-                if (math.lengthsq(goalPosition - ModelPosition(in targetRuntimeData)) <= 0.00000001f)
+                if (math.lengthsq(goalPosition - ModelPosition(ref runtimeContext, controller.targetBoneIndex)) <= math.EPSILON)
                 {
                     return;
                 }
@@ -948,15 +997,14 @@ namespace UMT
                 {
                     for (int linkIndex = 0; linkIndex < controller.linkCount; ++linkIndex)
                     {
-                        IKLinkData link = ikLinks[controller.linkStartIndex + linkIndex];
+                        IKLinkData link = runtimeContext.ikLinks[controller.linkStartIndex + linkIndex];
                         if (link.fixAxis == MMDIKFixAxis.Fix)
                         {
                             continue;
                         }
 
                         SolveIKLinks(ref runtimeContext, in controller, in goalPosition, linkIndex, iteration < controller.iterations / 2);
-                        targetRuntimeData = runtimeContext.boneSolverData[controller.targetBoneIndex];
-                        if (math.lengthsq(goalPosition - ModelPosition(in targetRuntimeData)) <= math.EPSILON)
+                        if (math.lengthsq(goalPosition - ModelPosition(ref runtimeContext, controller.targetBoneIndex)) <= math.EPSILON)
                         {
                             return;
                         }
@@ -964,7 +1012,7 @@ namespace UMT
                 }
             }
 
-            private static void SolveIKLink(in float3 goalPosition, in float3 linkPosition, in float3 effectorPosition, in float4x4 parentWorldMatrix, in MMDBoneTransform.BoneSolverData linkData, bool hasAngleLimit, in float3 lowerLimit, in float3 upperLimit, MMDIKFixAxis fixAxis, MMDIKEulerOrder eulerOrder, float angleLimit, int linkIndex, bool reflectLimitedAngle, out quaternion solvedIKRotation, out bool solved)
+            private static void SolveIKLink(in float3 goalPosition, in float3 linkPosition, in float3 effectorPosition, in float4x4 parentWorldMatrix, in MMDBoneTransform.BoneSolverState linkData, bool hasAngleLimit, in float3 lowerLimit, in float3 upperLimit, MMDIKFixAxis fixAxis, MMDIKEulerOrder eulerOrder, float angleLimit, int linkIndex, bool reflectLimitedAngle, out quaternion solvedIKRotation, out bool solved)
             {
                 solvedIKRotation = linkData.ikRotation;
                 solved = false;
@@ -1029,23 +1077,21 @@ namespace UMT
             private static void SolveIKLinks(ref SolverContext runtimeContext, in IKControllerData controller, in float3 goalPosition, int linkIndex, bool reflectLimitedAngle)
             {
                 IKLinkData link = runtimeContext.ikLinks[controller.linkStartIndex + linkIndex];
-                MMDBoneTransform.BoneSolverData linkRuntimeData = runtimeContext.boneSolverData[link.boneIndex];
-                float3 linkPosition = ModelPosition(in linkRuntimeData);
+                ref MMDBoneTransform.BoneSolverState linkState = ref ElementAt(runtimeContext.boneStateData, link.boneIndex);
+                float3 linkPosition = linkState.worldMatrix.c3.xyz;
                 float4x4 parentWorldMatrix = MMDBoneTransform.GetParentWorldMatrix(ref runtimeContext, link.boneIndex);
-                MMDBoneTransform.BoneSolverData targetRuntimeData = runtimeContext.boneSolverData[controller.targetBoneIndex];
-                float3 effectorPosition = ModelPosition(in targetRuntimeData);
-                SolveIKLink(in goalPosition, in linkPosition, in effectorPosition, in parentWorldMatrix, in linkRuntimeData, link.hasAngleLimit, in link.lowerLimit, in link.upperLimit, link.fixAxis, link.eulerOrder, controller.angleLimit, linkIndex, reflectLimitedAngle, out quaternion solvedIKRotation, out bool solved);
+                float3 effectorPosition = ModelPosition(ref runtimeContext, controller.targetBoneIndex);
+                SolveIKLink(in goalPosition, in linkPosition, in effectorPosition, in parentWorldMatrix, in linkState, link.hasAngleLimit, in link.lowerLimit, in link.upperLimit, link.fixAxis, link.eulerOrder, controller.angleLimit, linkIndex, reflectLimitedAngle, out quaternion solvedIKRotation, out bool solved);
                 if (solved)
                 {
-                    linkRuntimeData.ikRotation = solvedIKRotation;
-                    runtimeContext.boneSolverData[link.boneIndex] = linkRuntimeData;
+                    linkState.ikRotation = solvedIKRotation;
                     RecalculateIKChain(ref runtimeContext, in controller, linkIndex);
                 }
             }
 
-            private static float3 ModelPosition(in MMDBoneTransform.BoneSolverData runtimeData)
+            private static float3 ModelPosition(ref SolverContext runtimeContext, int boneIndex)
             {
-                return math.transform(runtimeData.worldMatrix, float3.zero);
+                return ElementAt(runtimeContext.boneStateData, boneIndex).worldMatrix.c3.xyz;
             }
 
             private static void RecalculateBaseIKChain(ref SolverContext runtimeContext, in IKControllerData controller, int linkIndex)
@@ -1197,10 +1243,9 @@ namespace UMT
                 for (int i = linkIndex; i >= 0; --i)
                 {
                     IKLinkData link = runtimeContext.ikLinks[controller.linkStartIndex + i];
-                    MMDBoneTransform.BoneSolverData runtimeData = runtimeContext.boneSolverData[link.boneIndex];
                     float4x4 parentWorldMatrix = MMDBoneTransform.GetParentWorldMatrix(ref runtimeContext, link.boneIndex);
-                    MMDBoneTransform.UpdateLocalMatrixIKLink(ref runtimeData, parentWorldMatrix);
-                    runtimeContext.boneSolverData[link.boneIndex] = runtimeData;
+                    ref MMDBoneTransform.BoneSolverState state = ref ElementAt(runtimeContext.boneStateData, link.boneIndex);
+                    MMDBoneTransform.UpdateLocalMatrixIKLink(ref state, parentWorldMatrix);
                 }
 
                 MMDBoneTransform.UpdateLocalMatrix(ref runtimeContext, controller.targetBoneIndex);

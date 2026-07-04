@@ -15,10 +15,10 @@ namespace UMT
             int frameCount = checked((int)lastFrame + 1);
             ReportProgress(progress, Stage.BoneConversion, 0, frameCount);
 
-            ref NativeArray<MMDBoneTransform.BoneSolverData> boneSolverData = ref transformContext.boneSolverData;
-            int boneCount = boneSolverData.Length;
+            ref NativeArray<MMDBoneTransform.BoneSolverConfig> boneConfigData = ref transformContext.boneConfigData;
+            int boneCount = boneConfigData.Length;
 
-            NativeList<ResolvedBoneFrame> resolvedBoneFrames = BuildSortedResolvedBoneFrames(animation, ref resolver, in boneSolverData, boneCount, frameCount, Allocator.Persistent);
+            NativeList<ResolvedBoneFrame> resolvedBoneFrames = BuildSortedResolvedBoneFrames(animation, ref resolver, in boneConfigData, boneCount, frameCount, Allocator.Persistent);
             NativeArray<bool> sourceBoneSelection = new NativeArray<bool>(boneCount, Allocator.Persistent);
             NativeArray<int> sourceTrackIndexByBone = new NativeArray<int>(boneCount, Allocator.Persistent);
             NativeList<int> sourceBoneIndices = new NativeList<int>(Allocator.Persistent);
@@ -26,7 +26,7 @@ namespace UMT
 
             NativeArray<BoneSample> boneSamples = new NativeArray<BoneSample>(checked(sourceBoneIndices.Length * frameCount), Allocator.Persistent);
             AnimationMath.FillCompactBoneSamples(in resolvedBoneFrames, in sourceTrackIndexByBone, ref boneSamples, frameCount);
-            AnimationMath.SeedAndFixSparseBoneSamples(in boneSolverData, in sourceBoneIndices, ref boneSamples, frameCount);
+            AnimationMath.SeedAndFixSparseBoneSamples(in boneConfigData, in sourceBoneIndices, ref boneSamples, frameCount);
 
             NativeArray<Keyframe> positionX = new NativeArray<Keyframe>(frameCount, Allocator.TempJob);
             NativeArray<Keyframe> positionY = new NativeArray<Keyframe>(frameCount, Allocator.TempJob);
