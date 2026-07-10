@@ -23,6 +23,16 @@ namespace UMT
         private const int k_SolverIterations = 4;
         private const int k_MaxSubSteps = 120;
         private const float k_FixedTimeStep = 1.0f / 120.0f;
+        /// <summary>MMD's reference solver iteration count; the spring damping compensation below is expressed relative to it.</summary>
+        private const int k_MMDReferenceSolverIterations = 4;
+        /// <summary>Bullet's default convex collision margin, in MMD units; scaled into Unity units for the native config.</summary>
+        private const float k_BulletConvexMargin = 0.04f;
+        /// <summary>Bullet spring damping for Spring6DOF translation rows: solverIterations / referenceIterations keeps the spring motor's target velocity matched to the MMD reference.</summary>
+        private const float k_SpringTranslationDamping = (float)k_SolverIterations / k_MMDReferenceSolverIterations;
+        /// <summary>Bullet spring damping for Spring6DOF rotation rows: solverIterations / (referenceIterations * scale^2). Bullet's motor-based spring drives targetVelocity = fps * (damping / iterations) * stiffness * angle with impulse clamp stiffness * angle / fps; the clamp scales correctly with the scale^2 stiffness factor (inertia grows with scale^2 at fixed mass) but the velocity term carries no inertia, so without this compensation the meter-scale simulation leaves MMD's operating regime - historically Unity's rotation springs were much SOFTER than MMD because the tiny meter-scale inertias fell into the motor's velocity-limited regime. With it, target velocity, impulse clamp, and the regime boundary all match MMD's unit-scale reference exactly.</summary>
+        private const float k_SpringRotationDamping = (float)k_SolverIterations / (k_MMDReferenceSolverIterations * MMDConstants.k_MMDUnitToUnityUnit * MMDConstants.k_MMDUnitToUnityUnit);
+        /// <summary>Redundant point-to-point constraint copies per fully-locked-translation joint (tLim min == max == 0). Each copy re-solves those equality rows once more per solver iteration, so spring-less locked hair chains survive fast motion at MMD's 4 iterations without firming up rotation limits, springs, or contacts; the converged pose is unchanged. Empirically the chains need ~12-iteration-equivalent convergence, hence 2 copies at 4 iterations.</summary>
+        private const int k_LockedTranslationReinforceCount = 2;
 
         /// <summary>Rigid-body components managed by this physics manager.</summary>
         public MMDRigidBody[] rigidBodies = Array.Empty<MMDRigidBody>();
@@ -50,6 +60,12 @@ namespace UMT
             internal NativeArray<int> sortedSimulatedRigidBodyIndices;
             /// <summary>Per-rigid-body simulation data mirrored to the native context.</summary>
             internal NativeArray<MMDRigidBody.RigidBodySimulationData> rigidBodySimulationData;
+            /// <summary>Kinetic-body world targets of the previous physics frame (indexed like <see cref="kineticRigidBodyIndices"/>), interpolated toward the current targets across the fixed substeps so kinematic bodies move continuously with Bullet-derived velocities instead of teleporting once per frame.</summary>
+            internal NativeArray<float4x4> previousKineticTargets;
+            /// <summary>Scratch: current-frame kinetic-body world targets.</summary>
+            internal NativeArray<float4x4> currentKineticTargets;
+            /// <summary>Unconsumed simulation time carried between frames so variable frame times map onto whole fixed substeps without drifting.</summary>
+            internal float timeAccumulator;
             /// <summary>Whether the initial bone-driven rigid-body pose has been applied.</summary>
             [MarshalAs(UnmanagedType.U1)]
             internal bool initialPoseApplied;
@@ -96,7 +112,7 @@ namespace UMT
         internal void Initialize()
         {
             DisposePhysics();
-            m_PhysicsSolverContext.bulletPhysicsContext = new MMDBulletPhysics(new float3(0.0f, -k_MMDPhysicsGravity * MMDConstants.k_MMDUnitToUnityUnit, 0.0f), k_SolverIterations, k_MaxSubSteps, k_FixedTimeStep);
+            m_PhysicsSolverContext.bulletPhysicsContext = CreateConfiguredBulletPhysics();
 
             RebuildRuntimeData();
             BuildRigidBodies();
@@ -141,7 +157,7 @@ namespace UMT
             }
 
             DisposePhysicsContext(ref runtimeContext);
-            runtimeContext.bulletPhysicsContext = new MMDBulletPhysics(new float3(0.0f, -k_MMDPhysicsGravity * MMDConstants.k_MMDUnitToUnityUnit, 0.0f), k_SolverIterations, k_MaxSubSteps, k_FixedTimeStep);
+            runtimeContext.bulletPhysicsContext = CreateConfiguredBulletPhysics();
             ResizePersistent(ref runtimeContext.rigidBodySimulationData, model.rigidBodies.Length);
             ResizePersistent(ref runtimeContext.worldTransforms, model.rigidBodies.Length);
             ResizePersistent(ref runtimeContext.rigidBodyIndices, model.rigidBodies.Length);
@@ -184,6 +200,26 @@ namespace UMT
         }
 
         /// <summary>
+        /// Creates the native Bullet context with MMD gravity/solver settings and applies the tunable configuration: spring damping compensation (so the motor-based 6DOF springs reproduce MMD's unit-scale reference at Unity's meter scale) and locked-translation reinforcement (so spring-less locked chains survive fast motion at MMD's 4 iterations). Ground plane, unit scale, and convex margin restate the historical defaults.
+        /// </summary>
+        /// <returns>The configured native physics context wrapper.</returns>
+        private static MMDBulletPhysics CreateConfiguredBulletPhysics()
+        {
+            MMDBulletPhysics bulletPhysics = new MMDBulletPhysics(new float3(0.0f, -k_MMDPhysicsGravity * MMDConstants.k_MMDUnitToUnityUnit, 0.0f), k_SolverIterations, k_MaxSubSteps, k_FixedTimeStep);
+            bulletPhysics.SetConfig(new MMDBulletPhysics.NativeConfig
+            {
+                groundNormal = new float3(0.0f, 1.0f, 0.0f),
+                groundConstant = 0.0f,
+                mmdUnitToUnityUnit = MMDConstants.k_MMDUnitToUnityUnit,
+                convexMargin = k_BulletConvexMargin * MMDConstants.k_MMDUnitToUnityUnit,
+                springTranslationDamping = k_SpringTranslationDamping,
+                springRotationDamping = k_SpringRotationDamping,
+                lockedTranslationReinforce = k_LockedTranslationReinforceCount,
+            });
+            return bulletPhysics;
+        }
+
+        /// <summary>
         /// Resets a physics solver context's native simulation with the given seed and clears its initial-pose-applied flag, if the context is valid.
         /// </summary>
         /// <param name="seed">Random seed used to reset the simulation.</param>
@@ -215,6 +251,8 @@ namespace UMT
             DisposeNativeArray(ref runtimeContext.kineticRigidBodyIndices);
             DisposeNativeArray(ref runtimeContext.sortedSimulatedRigidBodyIndices);
             DisposeNativeArray(ref runtimeContext.rigidBodySimulationData);
+            DisposeNativeArray(ref runtimeContext.previousKineticTargets);
+            DisposeNativeArray(ref runtimeContext.currentKineticTargets);
             runtimeContext = default;
         }
 
@@ -261,6 +299,8 @@ namespace UMT
             DisposeNativeArray(ref m_PhysicsSolverContext.kineticRigidBodyIndices);
             DisposeNativeArray(ref m_PhysicsSolverContext.sortedSimulatedRigidBodyIndices);
             DisposeNativeArray(ref m_PhysicsSolverContext.rigidBodySimulationData);
+            DisposeNativeArray(ref m_PhysicsSolverContext.previousKineticTargets);
+            DisposeNativeArray(ref m_PhysicsSolverContext.currentKineticTargets);
         }
 
         private void OnDestroy()
@@ -500,6 +540,8 @@ namespace UMT
 
                 ResizePersistent(ref runtimeContext.kineticRigidBodyIndices, kineticCount);
                 ResizePersistent(ref runtimeContext.sortedSimulatedRigidBodyIndices, simulatedCount);
+                ResizePersistent(ref runtimeContext.previousKineticTargets, kineticCount);
+                ResizePersistent(ref runtimeContext.currentKineticTargets, kineticCount);
                 kineticCount = 0;
                 simulatedCount = 0;
                 for (int i = 0; i < runtimeContext.rigidBodySimulationData.Length; ++i)
@@ -544,19 +586,78 @@ namespace UMT
                 if (!runtimeContext.initialPoseApplied)
                 {
                     SeedRigidBodiesFromBones(in transformManagerContext, ref runtimeContext);
+                    if (elapsedTime <= 0.0f)
+                    {
+                        return;
+                    }
                 }
-                else
+                else if (elapsedTime <= 0.0f)
                 {
                     SyncBoneDrivenRigidBodies(in transformManagerContext, ref runtimeContext);
-                }
-
-                if (elapsedTime <= 0.0f)
-                {
                     return;
                 }
 
-                runtimeContext.bulletPhysicsContext.StepSimulation(elapsedTime);
-                ApplyDynamicRigidBodiesToBones(ref transformManagerContext, ref runtimeContext);
+                if (StepSimulationWithKineticInterpolation(elapsedTime, in transformManagerContext, ref runtimeContext))
+                {
+                    ApplyDynamicRigidBodiesToBones(ref transformManagerContext, ref runtimeContext);
+                }
+            }
+
+            /// <summary>
+            /// Advances the simulation in fixed substeps, moving the kinetic bodies along an interpolated path from their previous-frame targets to the current ones and pushing each waypoint WITHOUT clearing velocity, so Bullet derives proper kinematic velocities from the motion. This gives the constraint solver continuously-moving kinematic anchors it can track at MMD's reference iteration count, instead of the old once-per-frame teleport with zeroed velocity whose full-frame position error made translation-locked chains (spring-less hair) blow apart during fast motion. Variable frame times are carried in a time accumulator so they map onto whole substeps without drifting.
+            /// </summary>
+            /// <param name="elapsedTime">Elapsed time to simulate.</param>
+            /// <param name="transformManagerContext">Bone solver context supplying bone matrices for the kinetic targets.</param>
+            /// <param name="runtimeContext">Physics solver context to advance.</param>
+            /// <returns>Whether at least one substep was simulated.</returns>
+            private static bool StepSimulationWithKineticInterpolation(float elapsedTime, in MMDTransformManager.SolverContext transformManagerContext, ref PhysicsSolverContext runtimeContext)
+            {
+                ComputeKineticTargets(in transformManagerContext, ref runtimeContext, ref runtimeContext.currentKineticTargets);
+                runtimeContext.timeAccumulator += elapsedTime;
+                int substepCount = (int)(runtimeContext.timeAccumulator / k_FixedTimeStep);
+                if (substepCount <= 0)
+                {
+                    return false;
+                }
+
+                substepCount = math.min(substepCount, k_MaxSubSteps);
+                runtimeContext.timeAccumulator = math.min(runtimeContext.timeAccumulator - substepCount * k_FixedTimeStep, k_FixedTimeStep);
+
+                int kineticCount = runtimeContext.kineticRigidBodyIndices.Length;
+                for (int step = 0; step < substepCount; ++step)
+                {
+                    float alpha = (float)(step + 1) / substepCount;
+                    for (int i = 0; i < kineticCount; ++i)
+                    {
+                        float4x4 previous = runtimeContext.previousKineticTargets[i];
+                        float4x4 current = runtimeContext.currentKineticTargets[i];
+                        float3 position = math.lerp(previous.c3.xyz, current.c3.xyz, alpha);
+                        quaternion rotation = math.slerp(new quaternion(previous), new quaternion(current), alpha);
+                        runtimeContext.worldTransforms[i] = new float4x4(rotation, position);
+                    }
+                    runtimeContext.bulletPhysicsContext.SetRigidBodyTransforms(kineticCount, runtimeContext.worldTransforms, runtimeContext.kineticRigidBodyIndices, false);
+                    runtimeContext.bulletPhysicsContext.StepSimulation(k_FixedTimeStep);
+                }
+
+                NativeArray<float4x4> swap = runtimeContext.previousKineticTargets;
+                runtimeContext.previousKineticTargets = runtimeContext.currentKineticTargets;
+                runtimeContext.currentKineticTargets = swap;
+                return true;
+            }
+
+            /// <summary>
+            /// Computes the world target transform of every kinetic (bone-driven) rigid body from the current bone matrices.
+            /// </summary>
+            /// <param name="transformManagerContext">Bone solver context supplying bone matrices.</param>
+            /// <param name="runtimeContext">Physics solver context providing the kinetic index list and simulation data.</param>
+            /// <param name="targets">Output array, indexed like the kinetic index list.</param>
+            private static void ComputeKineticTargets(in MMDTransformManager.SolverContext transformManagerContext, ref PhysicsSolverContext runtimeContext, ref NativeArray<float4x4> targets)
+            {
+                for (int i = 0; i < runtimeContext.kineticRigidBodyIndices.Length; ++i)
+                {
+                    MMDRigidBody.RigidBodySimulationData rigidBody = runtimeContext.rigidBodySimulationData[runtimeContext.kineticRigidBodyIndices[i]];
+                    targets[i] = ComputeRigidBodyWorldTransform(rigidBody, in transformManagerContext.boneStateData);
+                }
             }
 
             private static void SeedRigidBodiesFromBones(in MMDTransformManager.SolverContext transformManagerContext, ref PhysicsSolverContext runtimeContext)
@@ -569,15 +670,18 @@ namespace UMT
 
                 runtimeContext.bulletPhysicsContext.SetRigidBodyTransforms(runtimeContext.rigidBodySimulationData.Length, runtimeContext.worldTransforms, runtimeContext.rigidBodyIndices, true);
 
+                ComputeKineticTargets(in transformManagerContext, ref runtimeContext, ref runtimeContext.previousKineticTargets);
+                runtimeContext.timeAccumulator = 0.0f;
                 runtimeContext.initialPoseApplied = true;
             }
 
+            // Hard-syncs kinetic bodies to the current pose (teleport, velocities cleared) for zero-elapsed updates, keeping the interpolation baseline in step.
             private static void SyncBoneDrivenRigidBodies(in MMDTransformManager.SolverContext transformManagerContext, ref PhysicsSolverContext runtimeContext)
             {
-                for (int i = 0; i < runtimeContext.kineticRigidBodyIndices.Length; ++i)
+                ComputeKineticTargets(in transformManagerContext, ref runtimeContext, ref runtimeContext.previousKineticTargets);
+                for (int i = 0; i < runtimeContext.previousKineticTargets.Length; ++i)
                 {
-                    MMDRigidBody.RigidBodySimulationData rigidBody = runtimeContext.rigidBodySimulationData[runtimeContext.kineticRigidBodyIndices[i]];
-                    runtimeContext.worldTransforms[i] = ComputeRigidBodyWorldTransform(rigidBody, in transformManagerContext.boneStateData);
+                    runtimeContext.worldTransforms[i] = runtimeContext.previousKineticTargets[i];
                 }
                 runtimeContext.bulletPhysicsContext.SetRigidBodyTransforms(runtimeContext.kineticRigidBodyIndices.Length, runtimeContext.worldTransforms, runtimeContext.kineticRigidBodyIndices, true);
             }

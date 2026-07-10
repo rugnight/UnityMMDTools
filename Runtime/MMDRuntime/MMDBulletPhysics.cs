@@ -54,6 +54,18 @@ namespace UMT
         }
 
         /// <summary>
+        /// Applies tunable context parameters (ground plane, unit scale, convex margin, spring damping, locked-translation reinforcement). Native defaults reproduce the historical hardcoded behavior, so calling this is only required to opt into the configurable values.
+        /// </summary>
+        /// <param name="config">Configuration to apply to the native context.</param>
+        public unsafe void SetConfig(in NativeConfig config)
+        {
+            fixed (NativeConfig* configPointer = &config)
+            {
+                Native.MMDBulletPhysicsSetConfig(m_NativeContext, configPointer);
+            }
+        }
+
+        /// <summary>
         /// Resets the simulation to its initial state using the given random seed.
         /// </summary>
         /// <param name="seed">Random seed used to reset the deterministic simulation.</param>
@@ -106,7 +118,7 @@ namespace UMT
         /// <param name="count">Number of rigid bodies to update.</param>
         /// <param name="worldTransforms">World transforms to apply, one per rigid body.</param>
         /// <param name="rigidBodyIndices">Indices of the rigid bodies being updated.</param>
-        /// <param name="clearVelocity">Whether to zero the linear and angular velocity.</param>
+        /// <param name="clearVelocity">True: teleport - also zeroes the linear/angular velocity and resets the interpolation transform. False: leaves the interpolation transform at its previous value so Bullet derives kinematic-body velocity from the pushed motion over the next fixed substep (push once per substep for correct velocities).</param>
         public unsafe void SetRigidBodyTransforms(int count, in NativeArray<float4x4> worldTransforms, in NativeArray<int> rigidBodyIndices, bool clearVelocity)
         {
             Native.MMDBulletPhysicsSetRigidBodyTransforms(m_NativeContext, (nuint)count, (float*)worldTransforms.GetUnsafeReadOnlyPtr(), (int*)rigidBodyIndices.GetUnsafeReadOnlyPtr(), clearVelocity);
@@ -140,6 +152,28 @@ namespace UMT
         public void StepSimulation(float elapsedTime)
         {
             Native.MMDBulletPhysicsStepSimulation(m_NativeContext, elapsedTime);
+        }
+
+        /// <summary>
+        /// Tunable native context parameters, marshalled to the native Bullet plugin. Field order is layout-critical and must stay in sync with the native <c>MMDBulletPhysics::NativeConfig</c>; do not reorder. Native defaults (an unset config) reproduce the historical hardcoded behavior exactly.
+        /// </summary>
+        [StructLayout(LayoutKind.Sequential)]
+        public struct NativeConfig
+        {
+            /// <summary>Ground-plane normal; historical default (0, 1, 0).</summary>
+            public float3 groundNormal;
+            /// <summary>Ground-plane constant (signed distance from origin along the normal); historical default 0.</summary>
+            public float groundConstant;
+            /// <summary>MMD-unit-to-Unity-unit scale; historical default 0.08.</summary>
+            public float mmdUnitToUnityUnit;
+            /// <summary>Scaled convex collision margin applied to box/capsule shapes; historical default 0.04 * 0.08.</summary>
+            public float convexMargin;
+            /// <summary>Bullet spring damping applied to the translation rows of Spring6DOF joints; historical default 1.0. Set to solverIterations / referenceIterations to keep the spring's motor target velocity matched to a reference simulation with a different iteration count.</summary>
+            public float springTranslationDamping;
+            /// <summary>Bullet spring damping applied to the rotation rows of Spring6DOF joints; historical default 1.0. Bullet's spring motor target velocity carries no inertia, so it is not invariant under uniform length scaling even though rotational stiffness is scaled by scale^2; set to solverIterations / (referenceIterations * scale^2) to reproduce the MMD-unit-scale reference exactly. The historical default 1.0 made Unity's meter-scale springs much SOFTER than MMD (the tiny inertias fell into the motor's velocity-limited regime).</summary>
+            public float springRotationDamping;
+            /// <summary>Number of redundant point-to-point constraint copies added per joint whose translation limits are fully locked (min == max == 0); historical default 0. Each copy re-solves those equality rows once more per solver iteration so spring-less locked chains (long hair) survive fast motion at MMD's 4 iterations; the converged pose is unchanged.</summary>
+            public int lockedTranslationReinforce;
         }
 
         /// <summary>
@@ -179,6 +213,9 @@ namespace UMT
 
             [DllImport(k_DllName, CallingConvention = CallingConvention.Cdecl)]
             public static extern void MMDBulletPhysicsDestroy(IntPtr context);
+
+            [DllImport(k_DllName, CallingConvention = CallingConvention.Cdecl)]
+            public unsafe static extern void MMDBulletPhysicsSetConfig(IntPtr context, [In] NativeConfig* config);
 
             [DllImport(k_DllName, CallingConvention = CallingConvention.Cdecl)]
             public static extern void MMDBulletPhysicsReset(IntPtr context, uint seed);

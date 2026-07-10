@@ -11,7 +11,7 @@ using UnityEngine.Rendering;
 namespace UMT
 {
     /// <summary>
-    /// Drives full skinning for one generated <see cref="SkinnedMeshRenderer"/> whose mesh contains SDEF vertices, in either GPU or CPU mode. Both CPU mode and the play-mode GPU path swap an all-root-bone-weighted runtime pass-through mesh onto the renderer and fill its rootBone-space vertices — the CPU path from a Burst job (<see cref="MMDSDEFSkinJob"/>) via SetVertices, the play-mode GPU path by the compute shader writing the mesh's vertex buffer directly, so no per-frame allocation or command-buffer re-encode occurs. In edit mode the compute shader instead overwrites the renderer's own skinned output buffer after Unity's skinning, re-acquiring that buffer per frame. All modes apply vertex-morph blend shapes and bone skinning (linear blend skinning for BDEF vertices, the SDEF formula for SDEF vertices) and share one set of native buffers. The owning <see cref="MMDTransformManager"/> selects the mode and calls <see cref="DispatchPlayMode"/> (play GPU), <see cref="Dispatch"/> (edit GPU), or <see cref="CPUScheduleJob"/>/<see cref="CPUApply"/> (CPU) after the bone solve.
+    /// Drives full skinning for one generated <see cref="SkinnedMeshRenderer"/> whose mesh contains SDEF vertices, in either GPU or CPU mode. Both CPU mode and the play-mode GPU path swap an all-root-bone-weighted runtime pass-through mesh onto the renderer and fill its rootBone-space vertices. The CPU path from a Burst job (<see cref="MMDSDEFSkinJob"/>) via SetVertices, the play-mode GPU path by the compute shader writing the mesh's vertex buffer directly, so no per-frame allocation or command-buffer re-encode occurs. In edit mode the compute shader instead overwrites the renderer's own skinned output buffer after Unity's skinning, re-acquiring that buffer per frame. All modes apply vertex-morph blend shapes and bone skinning (linear blend skinning for BDEF vertices, the SDEF formula for SDEF vertices) and share one set of native buffers. The owning <see cref="MMDTransformManager"/> selects the mode and calls <see cref="DispatchPlayMode"/> (play GPU), <see cref="Dispatch"/> (edit GPU), or <see cref="CPUScheduleJob"/>/<see cref="CPUApply"/> (CPU) after the bone solve.
     /// </summary>
     [DisallowMultipleComponent]
     public sealed class MMDSDEFSkinner : MonoBehaviour, IDisposable
@@ -677,7 +677,7 @@ namespace UMT
         }
 
         /// <summary>
-        /// Drops every cached rig dependency — the pass-through mesh, the cached bone arrays, the bone transform access array, and the GPU resources of both variants — so the next dispatch re-captures the renderer's current mesh, bones, and root bone. Call this BEFORE re-rigging the renderer at runtime: it first restores the original mesh and bones (undoing the pass-through swap), after which the new rig can be assigned and is picked up on the next skinning frame.
+        /// Drops every cached rig dependency : the pass-through mesh, the cached bone arrays, the bone transform access array, and the GPU resources of both variants. So the next dispatch re-captures the renderer's current mesh, bones, and root bone. Call this BEFORE re-rigging the renderer at runtime: it first restores the original mesh and bones (undoing the pass-through swap), after which the new rig can be assigned and is picked up on the next skinning frame.
         /// </summary>
         public void NotifyRigChanged()
         {

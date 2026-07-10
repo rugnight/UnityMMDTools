@@ -5,6 +5,18 @@ All notable changes to this package will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-07-10
+
+### Added
+
+- `MMDBulletPhysics.SetConfig(in NativeConfig)` and the corresponding native `MMDBulletPhysicsSetConfig` entry point. `NativeConfig` exposes tunable context parameters (ground plane, MMD unit scale, convex collision margin, Spring6DOF translation/rotation spring damping, locked-translation reinforcement); native defaults reproduce the previous hardcoded behavior, and `MMDPhysicsManager` now applies the configuration to every context it creates.
+
+### Fixed
+
+- Kinematic (bone-driven) rigid bodies now move along an interpolated path from their previous-frame targets across fixed substeps, pushed without clearing velocity so Bullet derives proper kinematic velocities, replacing the once-per-frame teleport with zeroed velocity. Variable frame times are carried in a time accumulator so they map onto whole substeps without drifting. This gives the constraint solver continuously-moving anchors it can track at MMD's 4 solver iterations, so translation-locked spring-less chains (long hair) no longer blow apart during fast motion.
+- Spring6DOF rotation springs now reproduce MMD's unit-scale reference at Unity's meter scale via spring damping compensation (`solverIterations / (referenceIterations * scale^2)`). Bullet's motor-based spring target velocity carries no inertia and is not invariant under uniform length scaling, so the meter-scale rotation springs were previously much softer than in MMD.
+- Joints whose translation limits are fully locked get redundant point-to-point constraint copies (2 by default) that re-solve those equality rows once more per solver iteration, so locked chains converge at MMD's 4 iterations without changing the converged pose.
+
 ## [0.4.0] - 2026-07-05
 
 ### Changed
