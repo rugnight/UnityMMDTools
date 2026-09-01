@@ -5,6 +5,12 @@ All notable changes to this package will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-09-02
+
+### Fixed
+
+- PMX import failed with `UMTResources is missing m_PMXRenameListsJson` when the package was installed as an immutable UPM package (e.g. via git URL into `Library/PackageCache`). Seven resource `.meta` files (`PMXRenameLists.json`, `PMXHumanoidAvatarMappings.json`, `PMXVRMSpringBoneGroups.json`, and the four Kawazu dictionary `.bytes` files) declared `DefaultImporter`, so Unity imported them as `DefaultAsset` instead of `TextAsset` and every `TextAsset` reference on `UMTResources.asset` resolved to null. The metas now declare `TextScriptImporter`; GUIDs are unchanged, so existing references keep working. (#1)
+
 ## [0.5.0] - 2026-07-10
 
 ### Added
