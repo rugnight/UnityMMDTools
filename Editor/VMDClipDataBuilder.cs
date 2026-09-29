@@ -15,11 +15,11 @@ namespace UMT.Editor
             "localRotation.x", "localRotation.y", "localRotation.z", "localRotation.w",
         };
 
-        // Non-baked bone channels: VMDClipData.curves[6 * boneIndex + c]. Euler channels use SetEditorCurve.
+        // Non-baked bone channels: VMDClipData.curves[7 * boneIndex + c]. R02 fork: dense quaternion channels (was sparse localEulerAnglesRaw).
         private static readonly string[] k_NonBakedBoneProperties =
         {
             "localPosition.x", "localPosition.y", "localPosition.z",
-            "localEulerAnglesRaw.x", "localEulerAnglesRaw.y", "localEulerAnglesRaw.z",
+            "localRotation.x", "localRotation.y", "localRotation.z", "localRotation.w",
         };
 
         /// <summary>

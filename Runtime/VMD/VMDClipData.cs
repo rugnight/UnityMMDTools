@@ -11,7 +11,7 @@ namespace UMT
     /// <para>Channel layouts used in this package:</para>
     /// <list type="bullet">
     /// <item><description>Baked bones: <c>x = 7</c> per bone &#8211; localPosition x/y/z, localRotation x/y/z/w (quaternion).</description></item>
-    /// <item><description>Non-baked bones: <c>x = 6</c> per bone &#8211; localPosition x/y/z, localEulerAnglesRaw x/y/z.</description></item>
+    /// <item><description>Non-baked bones: <c>x = 7</c> per bone &#8211; localPosition x/y/z, localRotation x/y/z/w (quaternion, dense per frame; R02 fork, was 6 channels with localEulerAnglesRaw).</description></item>
     /// <item><description>Morph and IK toggle: <c>x = 1</c> per path.</description></item>
     /// </list>
     /// </remarks>
