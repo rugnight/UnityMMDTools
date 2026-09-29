@@ -1086,7 +1086,8 @@ namespace UMT
                     positionY[sampleIndex] = new Keyframe(time, sample.position.y);
                     positionZ[sampleIndex] = new Keyframe(time, sample.position.z);
 
-                    float3 euler = math.Euler(sample.rotation, math.RotationOrder.ZXY);
+                    // localEulerAnglesRaw is in degrees; math.Euler returns radians (R02 fork fix). Convert before unwrapping, which also works in degrees.
+                    float3 euler = math.degrees(math.Euler(sample.rotation, math.RotationOrder.ZXY));
                     if (sampleIndex > 0)
                     {
                         euler.x = previousEuler.x + DeltaAngle(previousEuler.x, euler.x);
