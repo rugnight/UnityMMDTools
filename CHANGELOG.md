@@ -5,6 +5,12 @@ All notable changes to this package will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
+## [0.5.1-r02.3] - 2026-10-03
+
+### Fixed
+
+- Humanoid avatar was not built for models without the optional 腰 bone (Hips is mapped from 腰): when Hips is not mapped, the lowest PMX bone that is an ancestor of Spine and both upper legs (e.g. グルーブ) is used as Hips.
+
 ## [0.5.1] - 2026-09-02
 
 ### Fixed

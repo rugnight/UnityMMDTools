@@ -1,7 +1,7 @@
 {
 	"name": "com.candidumgames.unitymmdtools",
 	"displayName":"MMD Tools for Unity",
-	"version": "0.5.1-r02.2",
+	"version": "0.5.1-r02.3",
 	"unity": "2022.3",
 	"unityRelease": "22f1",
 	"description": "Unity MMD Tools (UMT) is a toolkit for maximally reproducing MikuMikuDance (MMD) behaviour in Unity.",

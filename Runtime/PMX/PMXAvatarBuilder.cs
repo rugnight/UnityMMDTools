@@ -158,7 +158,45 @@ namespace UMT
                 mappedBones[(int)humanBodyBone] = bone.gameObject;
             }
 
+            MapHipsFromCommonAncestor(mappedBones, bones, usedTransforms);
             return mappedBones;
+        }
+
+        /// <summary>
+        /// Models without the optional 腰 bone (the usual source of Hips) still have a bone that parents both the spine and the legs
+        /// (for example グルーブ when 上半身 and 下半身 hang directly from it). When Hips is not mapped, uses the lowest PMX bone that is an ancestor
+        /// of Spine and both upper legs, so such models still get a humanoid avatar.
+        /// </summary>
+        private static void MapHipsFromCommonAncestor(GameObject[] mappedBones, Transform[] bones, HashSet<Transform> usedTransforms)
+        {
+            if (mappedBones[(int)HumanBodyBones.Hips] != null)
+            {
+                return;
+            }
+
+            GameObject spine = mappedBones[(int)HumanBodyBones.Spine];
+            GameObject leftLeg = mappedBones[(int)HumanBodyBones.LeftUpperLeg];
+            GameObject rightLeg = mappedBones[(int)HumanBodyBones.RightUpperLeg];
+            if (spine == null || leftLeg == null || rightLeg == null)
+            {
+                return;
+            }
+
+            HashSet<Transform> pmxBones = new HashSet<Transform>(bones);
+            for (Transform candidate = spine.transform.parent; candidate != null; candidate = candidate.parent)
+            {
+                if (!pmxBones.Contains(candidate) || usedTransforms.Contains(candidate))
+                {
+                    continue;
+                }
+
+                if (leftLeg.transform.IsChildOf(candidate) && rightLeg.transform.IsChildOf(candidate))
+                {
+                    usedTransforms.Add(candidate);
+                    mappedBones[(int)HumanBodyBones.Hips] = candidate.gameObject;
+                    return;
+                }
+            }
         }
 
         private static HumanBone[] BuildHumanBones(GameObject[] mappedBones)
