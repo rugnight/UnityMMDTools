@@ -346,6 +346,15 @@ namespace UMT
         {
             cancellationToken.ThrowIfCancellationRequested();
 
+            if (options.modelPostprocess != null)
+            {
+                using (UMTTiming.Measure(options.timingCallback, "Postprocess Model"))
+                {
+                    options.modelPostprocess(model);
+                }
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+
             PMXRenameResult renameResult = null;
             if (options.applyRenames)
             {

@@ -37,5 +37,7 @@ namespace UMT
         public float alphaCoverageZWriteThreshold = 0.90f;
         /// <summary>Optional per-slot material overrides keyed by the generated material name (the sanitized slot key). When an entry exists for a slot, the builder uses that material directly instead of generating one.</summary>
         public Dictionary<string, Material> materialOverrides;
+        /// <summary>Optional callback invoked with the freshly parsed model, before renames and before any Unity object is built. It may edit the model in place (for example append morphs); everything built afterwards (meshes, blend shapes, SDEF morph tables, material groups, metadata) sees the edited model.</summary>
+        public Action<PMXModel> modelPostprocess;
     }
 }

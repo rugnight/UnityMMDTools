@@ -5,6 +5,13 @@ All notable changes to this package will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
+## [0.5.1-r02.5] - 2026-10-04
+
+### Added
+
+- `PMXImportOptions.modelPostprocess`: an optional callback invoked with the freshly parsed `PMXModel`, before renames and before any Unity object is built, so a project can edit the model in place (for example append vertex morphs). Everything built afterwards (meshes, blend shapes, SDEF morph tables, morph-linked material groups, metadata) sees the edited model.
+- `UMT.Editor.PMXImportHooks.modelRead` (`Action<PMXModel, string assetPath>`): a static event that `PMXScriptedImporter` passes to `modelPostprocess`. Nothing is registered by default, in which case imports are unchanged. Unity does not track what a handler reads, so the project reimports affected assets itself when its inputs change.
+
 ## [0.5.1-r02.3] - 2026-10-03
 
 ### Fixed

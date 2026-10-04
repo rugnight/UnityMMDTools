@@ -48,6 +48,7 @@ namespace UMT.Editor
                 parent = null,
                 loadTextures = (model, opts) => PMXProjectTextures.Load(model, ctx.assetPath),
                 timingCallback = timingCollector.RecordTiming,
+                modelPostprocess = PMXImportHooks.For(ctx.assetPath),
             };
 
             if (m_MaterialCreationMode == PMXMaterialCreationMode.Override)
@@ -106,6 +107,28 @@ namespace UMT.Editor
             }
 
             Debug.Log($"[PMX Import] {ctx.assetPath}: model={pipelineResult.modelName}, " + $"meshes={pipelineResult.meshCount}, materials={pipelineResult.materialCount}, " + $"remapped={pipelineResult.remappedMaterialCount}, " + $"avatar={pipelineResult.hasAvatar}, renamed={pipelineResult.renameCount}, " + $"vmdClips={m_VMDAnimations.Count}\n" + timingReport);
+        }
+    }
+
+    /// <summary>
+    /// Project-side hooks into <see cref="PMXScriptedImporter"/>. Nothing is registered by default, in which case imports are unchanged.
+    /// </summary>
+    public static class PMXImportHooks
+    {
+        /// <summary>
+        /// Invoked with the freshly parsed model and the asset path of the <c>.pmx</c> being imported, before renames and before any Unity object is built (<see cref="PMXImportOptions.modelPostprocess"/>).
+        /// Handlers may edit the model in place. An exception thrown by a handler fails the import and skips the remaining handlers, so handlers should catch their own errors. Register from an <c>[InitializeOnLoad]</c> class. Unity does not know what a handler reads, so the project must reimport the affected assets itself when its inputs change.
+        /// </summary>
+        public static event System.Action<PMXModel, string> modelRead;
+
+        internal static System.Action<PMXModel> For(string assetPath)
+        {
+            System.Action<PMXModel, string> handlers = modelRead;
+            if (handlers == null)
+            {
+                return null;
+            }
+            return model => handlers(model, assetPath);
         }
     }
 }
