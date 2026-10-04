@@ -156,6 +156,13 @@ namespace UMT
             /// <summary>Whether <see cref="worldMatrix"/> is already up to date for the current physics prepare pass; cleared at the start of each physics step and set only by the prepare pass so shared ancestor chains are computed once per step instead of once per rigid body.</summary>
             [MarshalAs(UnmanagedType.U1)]
             public bool worldMatrixValid;
+            /// <summary>Local position taken as this bone's input on the last reset (the sampled pose, or the initial pose when nothing wrote the bone); reused when the next sample still matches the solved value.</summary>
+            public float3 inputLocalPosition;
+            /// <summary>Local rotation taken as this bone's input on the last reset; see <see cref="inputLocalPosition"/>.</summary>
+            public quaternion inputLocalRotation;
+            /// <summary>Whether <see cref="inputLocalPosition"/> / <see cref="inputLocalRotation"/> hold an input from a previous reset.</summary>
+            [MarshalAs(UnmanagedType.U1)]
+            public bool hasInput;
 
             /// <summary>
             /// Creates a default solver state with identity rotations and world matrix, zero positions, and no solved transform.
@@ -307,7 +314,11 @@ namespace UMT
             }
 
             /// <summary>
-            /// Burst implementation that resets a bone's solver state toward its initial pose, restoring the initial local transform when the sampled transform still matches the previously solved value.
+            /// Burst implementation that resets a bone's solver state for a new pass. When the sampled transform still matches the previously solved value
+            /// (nothing wrote the bone since the last solve), the bone keeps its previous input instead of the sampled (solved) value, so constraints and IK
+            /// are not applied twice. The previous input is the initial pose for bones nothing writes (constraint followers, IK links); for bones an animation
+            /// writes, it is the animated value, so a held key (the same value written on consecutive frames) is not mistaken for "not written" and reset to
+            /// the initial pose every other frame (bones that are both animated and constraint targets flickered between the animated and the initial pose).
             /// </summary>
             /// <param name="config">Bone solver configuration.</param>
             /// <param name="state">Bone solver state to reset, updated in place.</param>
@@ -317,9 +328,14 @@ namespace UMT
             internal static void ResetRuntimeDataInternal(in BoneSolverConfig config, ref BoneSolverState state, in float3 currentLocalPosition, in quaternion currentLocalRotation)
             {
                 bool currentSolvedTransform = IsCurrentSolvedTransform(state.hasSolvedTransform, currentLocalPosition, currentLocalRotation, state.solvedLocalPosition, state.solvedLocalRotation);
+                float3 heldPosition = state.hasInput ? state.inputLocalPosition : config.initialLocalPosition;
+                quaternion heldRotation = state.hasInput ? state.inputLocalRotation : config.initialLocalRotation;
                 state = BoneSolverState.CreateDefault();
-                state.localPosition = currentSolvedTransform ? config.initialLocalPosition : currentLocalPosition;
-                state.localRotation = currentSolvedTransform ? config.initialLocalRotation : currentLocalRotation;
+                state.localPosition = currentSolvedTransform ? heldPosition : currentLocalPosition;
+                state.localRotation = currentSolvedTransform ? heldRotation : currentLocalRotation;
+                state.inputLocalPosition = state.localPosition;
+                state.inputLocalRotation = state.localRotation;
+                state.hasInput = true;
                 state.localPositionForIKLink = state.localPosition;
                 state.localRotationForIKLink = state.localRotation;
             }
