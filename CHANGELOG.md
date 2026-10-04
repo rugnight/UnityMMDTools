@@ -5,6 +5,12 @@ All notable changes to this package will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
+## [0.5.1-r02.6] - 2026-10-05
+
+### Fixed
+
+- Fixed-length strings (the VMD/PMX signatures, VMD model/bone/morph names) are read up to the first null byte. Some VMDs leave garbage after the terminator (for example the signature `Vocaloid Motion Data 0002\0\0\0\xE0i`); trimming only trailing nulls kept it, so `VMDReader` threw "Invalid VMD signature" and a name with such garbage would not match its bone or morph.
+
 ## [0.5.1-r02.5] - 2026-10-04
 
 ### Added

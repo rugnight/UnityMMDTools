@@ -108,40 +108,55 @@ namespace UMT
         }
 
         /// <summary>
-        /// Reads a fixed-length ASCII string into a 32-byte fixed string, trimming trailing null characters.
+        /// Reads a fixed-length ASCII string into a 32-byte fixed string, up to the first null character.
         /// </summary>
         /// <param name="byteCount">The number of bytes to read and decode as ASCII.</param>
         /// <returns>The decoded fixed string.</returns>
         public FixedString32Bytes ReadAscii32Bytes(int byteCount)
         {
+            byte[] bytes = m_Reader.ReadBytes(byteCount);
             FixedString32Bytes result = default;
-            result.CopyFromTruncated(Encoding.ASCII.GetString(m_Reader.ReadBytes(byteCount), 0, byteCount).TrimEnd('\0'));
+            result.CopyFromTruncated(Encoding.ASCII.GetString(bytes, 0, TerminatedLength(bytes)));
             return result;
         }
 
         /// <summary>
-        /// Reads a fixed-length ASCII string into a 128-byte fixed string, trimming trailing null characters.
+        /// Reads a fixed-length ASCII string into a 128-byte fixed string, up to the first null character.
         /// </summary>
         /// <param name="byteCount">The number of bytes to read and decode as ASCII.</param>
         /// <returns>The decoded fixed string.</returns>
         public FixedString128Bytes ReadAscii128Bytes(int byteCount)
         {
+            byte[] bytes = m_Reader.ReadBytes(byteCount);
             FixedString128Bytes result = default;
-            result.CopyFromTruncated(Encoding.ASCII.GetString(m_Reader.ReadBytes(byteCount), 0, byteCount).TrimEnd('\0'));
+            result.CopyFromTruncated(Encoding.ASCII.GetString(bytes, 0, TerminatedLength(bytes)));
             return result;
         }
 
         /// <summary>
-        /// Reads a fixed-length CP932 (Shift-JIS) string into a 32-byte fixed string, trimming trailing null characters.
+        /// Reads a fixed-length CP932 (Shift-JIS) string into a 32-byte fixed string, up to the first null character.
         /// </summary>
         /// <param name="byteCount">The number of bytes to read and decode as CP932.</param>
         /// <returns>The decoded fixed string.</returns>
         public FixedString32Bytes ReadCP932(int byteCount)
         {
             // Uses the self-contained ShiftJisDecoder rather than Encoding.GetEncoding(932), which is unavailable on IL2CPP/WebGL (throws NotSupportedException).
+            byte[] bytes = m_Reader.ReadBytes(byteCount);
             FixedString32Bytes result = default;
-            result.CopyFromTruncated(ShiftJisDecoder.GetString(m_Reader.ReadBytes(byteCount), 0, byteCount).TrimEnd('\0'));
+            result.CopyFromTruncated(ShiftJisDecoder.GetString(bytes, 0, TerminatedLength(bytes)));
             return result;
+        }
+
+        /// <summary>
+        /// Length of a fixed-length field up to its first null byte (the whole field when there is none).
+        /// MMD writes C strings into fixed-length fields and may leave garbage after the terminator
+        /// (seen: a VMD signature "Vocaloid Motion Data 0002\0\0\0\xE0i"), so trimming only trailing nulls is not enough.
+        /// A null byte is never a CP932 trail byte (0x40-0xFC), so cutting before decoding is safe.
+        /// </summary>
+        private static int TerminatedLength(byte[] bytes)
+        {
+            int index = Array.IndexOf(bytes, (byte)0);
+            return index < 0 ? bytes.Length : index;
         }
 
         /// <summary>
